@@ -175,6 +175,7 @@ export async function createApp(
     },
     close: async (): Promise<void> => {
       personalAI.directRunner.abortAll();
+      personalAI.openClawRunner.abortAll();
       personalAI.worker.stop();
       await background.wait();
       await deps.queue.whenIdle();

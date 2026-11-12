@@ -31,6 +31,15 @@ export interface TokenUsage {
   total_tokens: number;
 }
 
+export interface RawChatStreamRequest {
+  messages: ChatMessage[];
+  model?: string;
+  tools?: unknown[];
+  tool_choice?: unknown;
+  temperature?: number;
+  max_tokens?: number;
+}
+
 export class ModelAdapter {
   constructor(private readonly deps: ModelAdapterDeps) {}
 
@@ -42,20 +51,18 @@ export class ModelAdapter {
     return this.deps.personalAI.modelApiKeyOverride || this.deps.config.upstreamApiKey;
   }
 
-  /** 流式调用上游，逐块产出 assistant 文本。 */
-  async *stream(
-    messages: ChatMessage[],
-    options: {
-      model?: string;
-      signal?: AbortSignal;
-      /** 上游在流末尾返回 usage 时回调（OpenAI stream_options.include_usage）。 */
-      onUsage?: (usage: TokenUsage) => void;
-    } = {},
-  ): AsyncGenerator<string> {
+  /**
+   * 统一模型请求通道：复用知忆的模型设置、API Key、DUCX 认证刷新与超时控制。
+   * 供 text-only `stream()` 与 OpenClaw Tool Calling `openRawStream()` 共用。
+   */
+  async openRawStream(
+    request: RawChatStreamRequest,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ response: Response; model: string }> {
     const resolved: ResolvedUpstream | null = this.deps.upstream
-      ? await this.deps.upstream.resolveForRequest(options.model)
+      ? await this.deps.upstream.resolveForRequest(request.model)
       : null;
-    const modelName: string = resolved?.model || options.model || this.deps.config.defaultModel;
+    const modelName: string = resolved?.model || request.model || this.deps.config.defaultModel;
     const url: string = completionsUrl(resolved?.baseUrl ?? this.baseUrl());
 
     const buildHeaders = (auth: Record<string, string>): Record<string, string> => {
@@ -72,12 +79,21 @@ export class ModelAdapter {
     const signal: AbortSignal = options.signal
       ? (AbortSignal.any([options.signal, timeout]) as AbortSignal)
       : timeout;
-    const body: string = JSON.stringify({
+
+    const payload: Record<string, unknown> = {
       model: modelName,
-      messages,
+      messages: request.messages,
       stream: true,
       stream_options: { include_usage: true },
-    });
+    };
+    if (request.tools && request.tools.length > 0) {
+      payload.tools = request.tools;
+      if (request.tool_choice !== undefined) payload.tool_choice = request.tool_choice;
+    }
+    if (typeof request.temperature === 'number') payload.temperature = request.temperature;
+    if (typeof request.max_tokens === 'number') payload.max_tokens = request.max_tokens;
+
+    const body: string = JSON.stringify(payload);
     const send = (headers: Record<string, string>): Promise<Response> =>
       this.deps.transport(url, { method: 'POST', headers, body, signal });
 
@@ -86,7 +102,7 @@ export class ModelAdapter {
     if ((response.status === 401 || response.status === 403) && resolved?.authMode === 'ducx') {
       resolved.onAuthRejected();
       const refreshed: ResolvedUpstream | null | undefined =
-        await this.deps.upstream?.resolveForRequest(options.model);
+        await this.deps.upstream?.resolveForRequest(request.model);
       if (refreshed) response = await send(buildHeaders(refreshed.headers));
     }
 
@@ -98,7 +114,25 @@ export class ModelAdapter {
       );
     }
 
-    const reader: ReadableStreamDefaultReader<Uint8Array> = response.body.getReader();
+    return { response, model: modelName };
+  }
+
+  /** 流式调用上游，逐块产出 assistant 文本。 */
+  async *stream(
+    messages: ChatMessage[],
+    options: {
+      model?: string;
+      signal?: AbortSignal;
+      /** 上游在流末尾返回 usage 时回调（OpenAI stream_options.include_usage）。 */
+      onUsage?: (usage: TokenUsage) => void;
+    } = {},
+  ): AsyncGenerator<string> {
+    const { response } = await this.openRawStream(
+      { model: options.model, messages },
+      { signal: options.signal },
+    );
+
+    const reader: ReadableStreamDefaultReader<Uint8Array> = response.body!.getReader();
     const decoder: TextDecoder = new TextDecoder();
     let buffer = '';
     try {

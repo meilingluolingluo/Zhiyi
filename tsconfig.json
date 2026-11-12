@@ -1,9 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "CommonJS",
     "moduleResolution": "Node",
+    "baseUrl": ".",
+    "paths": {
+      "typebox": ["node_modules/typebox/build/index.d.mts"],
+      "typebox/*": ["node_modules/typebox/build/*/index.d.mts"]
+    },
     "outDir": "dist",
     "rootDir": ".",
     "strict": true,

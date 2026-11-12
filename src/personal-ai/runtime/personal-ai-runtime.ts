@@ -33,6 +33,8 @@ import type { TaskWorker } from '../worker/task-worker';
 import type { AgentSelector } from './agent-selector';
 import { buildPersonalAIContext, type BuiltContext } from './context-builder';
 import type { DirectExecutionRunner } from './direct-execution-runner';
+import type { OpenClawAgentRunner } from './openclaw/agent-runner';
+import { isOpenClawAgent } from './openclaw/types';
 import { planExecution } from './execution-planner';
 import {
   buildIntentClassificationPrompt,
@@ -65,6 +67,7 @@ export interface RuntimeDeps {
   businessTaskManager?: BusinessTaskManager;
   agentSelector?: AgentSelector;
   directRunner?: DirectExecutionRunner;
+  openClawRunner?: OpenClawAgentRunner;
 }
 
 export interface RunInput {
@@ -327,6 +330,7 @@ export class PersonalAIRuntime {
     execution: ExecutionTask,
     agent: AgentProfile,
     identity: PersonalAIIdentity,
+    prebuiltSystemMessage: string,
     modelName: string | undefined,
     signal: AbortSignal | undefined,
     usageOut: TokenUsage | undefined,
@@ -335,6 +339,42 @@ export class PersonalAIRuntime {
     this.deps.conversationStore.touch(identity, execution.id);
     yield { type: 'task_started', taskId: execution.id };
     yield { type: 'agent_started', taskId: execution.id, agentId: agent.agent_id };
+
+    if (isOpenClawAgent(agent) && this.deps.openClawRunner) {
+      try {
+        for await (const event of this.deps.openClawRunner.stream(
+          businessTask,
+          execution,
+          agent,
+          identity,
+          {
+            prebuiltSystemMessage,
+            signal,
+            modelOverride: modelName,
+            onUsage: (usage: TokenUsage): void => {
+              if (usageOut) {
+                usageOut.prompt_tokens += usage.prompt_tokens;
+                usageOut.completion_tokens += usage.completion_tokens;
+                usageOut.total_tokens += usage.total_tokens;
+              }
+            },
+            rethrowOnError: true,
+          },
+        )) {
+          if (event.type === 'text_delta') {
+            capture.text += event.content;
+          }
+          yield event;
+        }
+        yield { type: 'agent_completed', taskId: execution.id, agentId: agent.agent_id };
+      } catch (error) {
+        const message: string = error instanceof Error ? error.message : String(error);
+        yield { type: 'task_failed', taskId: execution.id, error: message };
+        capture.text = aggregateAgentResult({ taskId: execution.id, error: message });
+        yield { type: 'final_answer', content: capture.text };
+      }
+      return;
+    }
 
     if (!this.deps.directRunner) {
       // 无 DirectExecutionRunner 注入时的安全降级
@@ -374,6 +414,7 @@ export class PersonalAIRuntime {
       created: boolean;
     },
     identity: PersonalAIIdentity,
+    prebuiltSystemMessage: string,
     modelName: string | undefined,
     signal: AbortSignal | undefined,
     usageOut: TokenUsage | undefined,
@@ -386,6 +427,7 @@ export class PersonalAIRuntime {
           prepared.execution,
           prepared.agent,
           identity,
+          prebuiltSystemMessage,
           modelName,
           signal,
           usageOut,
@@ -608,6 +650,42 @@ export class PersonalAIRuntime {
         yield* this.dispatchPreparedDelegation(
           prepared,
           identity,
+          context.systemMessage,
+          modelName,
+          input.signal,
+          input.usage,
+          capture,
+        );
+        return;
+      }
+
+      // 显式通过 x-agent-id / API Key 指定了 OpenClaw Agent（非问候快路径）时，直接进入 OpenClaw 执行分支
+      const explicitAgentId: string | undefined = this.resolveExplicitPreferredAgent(identity);
+      const explicitOpenClawAgent: AgentProfile | undefined =
+        explicitAgentId && !isGreetingOnly(context.taskText)
+          ? this.deps.agentStore.get(explicitAgentId)
+          : undefined;
+      if (
+        explicitOpenClawAgent &&
+        explicitOpenClawAgent.status === 'active' &&
+        isOpenClawAgent(explicitOpenClawAgent) &&
+        this.deps.openClawRunner
+      ) {
+        const prepared = this.prepareExecutionRecord(
+          identity,
+          oneLine(context.taskText, 80) || '知忆 OpenClaw 任务',
+          context.taskText.slice(0, 2000),
+          explicitOpenClawAgent,
+          null,
+          input.timezone,
+        );
+        this.deps.logger.info(
+          `[personal-ai] mode=openclaw_agent agent=${explicitOpenClawAgent.agent_id}`,
+        );
+        yield* this.dispatchPreparedDelegation(
+          prepared,
+          identity,
+          context.systemMessage,
           modelName,
           input.signal,
           input.usage,
@@ -630,7 +708,7 @@ export class PersonalAIRuntime {
 
       const selected = this.deps.agentSelector?.select({
         taskText: context.taskText,
-        preferredAgentId: this.resolveExplicitPreferredAgent(identity),
+        preferredAgentId: explicitAgentId,
         multicaEnabled: this.deps.personalAI.multica.enabled,
         defaultAgentId: plan.agentId,
       });
@@ -650,6 +728,7 @@ export class PersonalAIRuntime {
       yield* this.dispatchPreparedDelegation(
         prepared,
         identity,
+        context.systemMessage,
         modelName,
         input.signal,
         input.usage,

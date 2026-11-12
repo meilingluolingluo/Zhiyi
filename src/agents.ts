@@ -13,7 +13,10 @@ import {
 } from './types';
 
 const SAFE_MULTICA_ASSIGNEE: RegExp = /^[A-Za-z0-9_ .+\-]{1,128}$/;
+const SAFE_TOOL_NAME: RegExp = /^[a-z][a-z0-9_]{0,63}$/;
 const CONTROL_CHARS: RegExp = /[\u0000-\u001f\u007f]/;
+const DIRECT_RUNTIMES: ReadonlySet<string> = new Set(['simple_llm', 'openclaw']);
+const TOOL_EXEC_MODES: ReadonlySet<string> = new Set(['sequential', 'parallel']);
 const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 const MAX_CAPABILITIES = 30;
 const MAX_CAPABILITY_LEN = 64;
@@ -196,7 +199,9 @@ function validateBackendConfig(value: unknown, backend: ExecutionBackend): Recor
     }
   }
   const allowedKeys: ReadonlySet<string> =
-    backend === 'multica' ? new Set(['assignee']) : new Set();
+    backend === 'multica'
+      ? new Set(['assignee'])
+      : new Set(['runtime', 'allowed_tools', 'max_turns', 'tool_execution']);
   for (const key of Object.getOwnPropertyNames(value)) {
     if (!allowedKeys.has(key)) {
       throw new DomainError(
@@ -213,6 +218,71 @@ function validateBackendConfig(value: unknown, backend: ExecutionBackend): Recor
       throw new DomainError(400, 'invalid_backend_config', 'backend_config.assignee 格式非法');
     }
     return { assignee: assignee.trim() };
+  }
+  if (backend === 'direct_llm') {
+    const cleaned: Record<string, unknown> = {};
+    if ('runtime' in value && value.runtime !== undefined) {
+      if (typeof value.runtime !== 'string' || !DIRECT_RUNTIMES.has(value.runtime)) {
+        throw new DomainError(
+          400,
+          'invalid_backend_config',
+          'backend_config.runtime 必须为 simple_llm | openclaw',
+        );
+      }
+      cleaned.runtime = value.runtime;
+    }
+    if ('allowed_tools' in value && value.allowed_tools !== undefined) {
+      if (!Array.isArray(value.allowed_tools) || value.allowed_tools.length > MAX_CAPABILITIES) {
+        throw new DomainError(
+          400,
+          'invalid_backend_config',
+          `backend_config.allowed_tools 必须为最多 ${MAX_CAPABILITIES} 项的工具名数组`,
+        );
+      }
+      const seenTools = new Set<string>();
+      const normalizedTools: string[] = [];
+      for (const item of value.allowed_tools) {
+        if (typeof item !== 'string' || !SAFE_TOOL_NAME.test(item.trim())) {
+          throw new DomainError(
+            400,
+            'invalid_backend_config',
+            'backend_config.allowed_tools 工具名格式非法（仅允许小写字母、数字和下划线）',
+          );
+        }
+        const trimmed = item.trim();
+        if (!seenTools.has(trimmed)) {
+          seenTools.add(trimmed);
+          normalizedTools.push(trimmed);
+        }
+      }
+      cleaned.allowed_tools = normalizedTools;
+    }
+    if ('max_turns' in value && value.max_turns !== undefined) {
+      if (
+        typeof value.max_turns !== 'number' ||
+        !Number.isInteger(value.max_turns) ||
+        value.max_turns < 1 ||
+        value.max_turns > 20
+      ) {
+        throw new DomainError(
+          400,
+          'invalid_backend_config',
+          'backend_config.max_turns 必须为 1-20 的整数',
+        );
+      }
+      cleaned.max_turns = value.max_turns;
+    }
+    if ('tool_execution' in value && value.tool_execution !== undefined) {
+      if (typeof value.tool_execution !== 'string' || !TOOL_EXEC_MODES.has(value.tool_execution)) {
+        throw new DomainError(
+          400,
+          'invalid_backend_config',
+          'backend_config.tool_execution 必须为 sequential | parallel',
+        );
+      }
+      cleaned.tool_execution = value.tool_execution;
+    }
+    return cleaned;
   }
   return {};
 }

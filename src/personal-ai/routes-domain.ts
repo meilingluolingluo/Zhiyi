@@ -10,8 +10,11 @@ import express, {
   type Response as ExpressResponse,
   type Router,
 } from 'express';
+import type { AgentStore } from '../agents';
+import type { AppConfig } from '../config';
 import type { Database } from '../db';
 import { errorBody } from '../errors';
+import type { MemoryStore } from '../memories';
 import type { AgentExecutionAdapter } from './adapters/agent/agent-adapter';
 import type { PersonalAIConfig } from './config';
 import type { GoalStore } from './domain/goal-store';
@@ -38,7 +41,10 @@ import {
   type HeaderBag,
   type PersonalAIIdentity,
 } from './identity/identity-manager';
+import { buildPersonalAIContext } from './runtime/context-builder';
 import type { DirectExecutionRunner } from './runtime/direct-execution-runner';
+import type { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
+import { isOpenClawAgent } from './runtime/openclaw/types';
 import type { BusinessTaskManager } from './task/business-task-manager';
 import type { TaskManager } from './task/task-manager';
 import type { TaskWorker } from './worker/task-worker';
@@ -46,6 +52,9 @@ import type { TaskWorker } from './worker/task-worker';
 export interface DomainRouterDeps {
   db: Database;
   config: PersonalAIConfig;
+  appConfig?: AppConfig;
+  agentStore?: AgentStore;
+  memoryStore?: MemoryStore;
   userProfiles: UserProfileStore;
   goalStore: GoalStore;
   projectStore: ProjectStore;
@@ -54,6 +63,7 @@ export interface DomainRouterDeps {
   worker: TaskWorker;
   adapter: AgentExecutionAdapter | null;
   directRunner: DirectExecutionRunner;
+  openClawRunner?: OpenClawAgentRunner;
 }
 
 interface RawBodyRequest extends ExpressRequest {
@@ -516,12 +526,41 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
       );
 
       if (prepared.agent.execution_backend === 'direct_llm') {
-        await deps.directRunner.run(
-          prepared.task,
-          prepared.execution,
-          prepared.agent,
-          identity,
-        );
+        if (isOpenClawAgent(prepared.agent) && deps.openClawRunner) {
+          const taskPrompt = [prepared.task.title, prepared.task.description]
+            .filter(Boolean)
+            .join('\n\n');
+          const builtContext =
+            deps.appConfig && deps.memoryStore && deps.agentStore
+              ? buildPersonalAIContext(
+                  {
+                    config: deps.appConfig,
+                    memoryStore: deps.memoryStore,
+                    agentStore: deps.agentStore,
+                    userProfiles: deps.userProfiles,
+                    goalStore: deps.goalStore,
+                    projectStore: deps.projectStore,
+                    businessTaskManager: deps.businessTaskManager,
+                  },
+                  identity,
+                  [{ role: 'user', content: taskPrompt || prepared.task.title }],
+                )
+              : undefined;
+          await deps.openClawRunner.run(
+            prepared.task,
+            prepared.execution,
+            prepared.agent,
+            identity,
+            { prebuiltSystemMessage: builtContext?.systemMessage },
+          );
+        } else {
+          await deps.directRunner.run(
+            prepared.task,
+            prepared.execution,
+            prepared.agent,
+            identity,
+          );
+        }
         const latestTask = deps.businessTaskManager.get(identity.user_id, prepared.task.id);
         const latestExecution = deps.taskManager.getForUser(
           identity.user_id,
@@ -570,6 +609,7 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
       for (const exec of outcome.cancelled_executions) {
         if (exec.execution_mode === 'direct_llm') {
           if (deps.directRunner.abort(exec.id)) externalCancelled = true;
+          if (deps.openClawRunner?.abort(exec.id)) externalCancelled = true;
         } else if (exec.external_task_id && deps.adapter?.cancelTask) {
           const ok: boolean = await deps.adapter.cancelTask(
             exec.external_task_id,

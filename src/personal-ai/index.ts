@@ -15,6 +15,8 @@ import { UserProfileStore } from './domain/user-profile-store';
 import { createPersonalAIDomainRouter } from './routes-domain';
 import { AgentSelector } from './runtime/agent-selector';
 import { DirectExecutionRunner } from './runtime/direct-execution-runner';
+import { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
+import { ZhiyiToolGateway } from './runtime/openclaw/tool-gateway';
 import { PersonalAIRuntime } from './runtime/personal-ai-runtime';
 import { createPersonalAIRouter } from './routes';
 import { BusinessTaskManager } from './task/business-task-manager';
@@ -35,6 +37,8 @@ export interface PersonalAIAssembly {
   projectStore: ProjectStore;
   businessTaskManager: BusinessTaskManager;
   directRunner: DirectExecutionRunner;
+  openClawRunner: OpenClawAgentRunner;
+  toolGateway: ZhiyiToolGateway;
   agentSelector: AgentSelector;
 }
 
@@ -110,6 +114,21 @@ export function createPersonalAI(
     logger: base.logger,
   });
 
+  const toolGateway: ZhiyiToolGateway = new ZhiyiToolGateway({
+    memoryStore: base.memoryStore,
+    businessTaskManager,
+    goalStore,
+    logger: base.logger,
+  });
+
+  const openClawRunner: OpenClawAgentRunner = new OpenClawAgentRunner({
+    config: base.config,
+    modelAdapter,
+    businessTaskManager,
+    toolGateway,
+    logger: base.logger,
+  });
+
   const agentSelector: AgentSelector = new AgentSelector(base.agentStore, repo);
 
   const runtime: PersonalAIRuntime = new PersonalAIRuntime({
@@ -132,6 +151,7 @@ export function createPersonalAI(
     businessTaskManager,
     agentSelector,
     directRunner,
+    openClawRunner,
   });
 
   const router: Router = express.Router();
@@ -145,12 +165,16 @@ export function createPersonalAI(
       worker,
       adapter,
       directRunner,
+      openClawRunner,
     }),
   );
   router.use(
     createPersonalAIDomainRouter({
       db: base.db,
       config,
+      appConfig: base.config,
+      agentStore: base.agentStore,
+      memoryStore: base.memoryStore,
       userProfiles,
       goalStore,
       projectStore,
@@ -159,6 +183,7 @@ export function createPersonalAI(
       worker,
       adapter,
       directRunner,
+      openClawRunner,
     }),
   );
 
@@ -175,6 +200,8 @@ export function createPersonalAI(
     projectStore,
     businessTaskManager,
     directRunner,
+    openClawRunner,
+    toolGateway,
     agentSelector,
   };
 }

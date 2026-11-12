@@ -30,6 +30,7 @@ import type { PersonalAIEvent } from './events/event-types';
 import { resolvePersonalAIIdentity, type HeaderBag, type PersonalAIIdentity } from './identity/identity-manager';
 import type { PersonalAIRuntime } from './runtime/personal-ai-runtime';
 import type { DirectExecutionRunner } from './runtime/direct-execution-runner';
+import type { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
 import type { TaskManager } from './task/task-manager';
 import type { TaskWorker } from './worker/task-worker';
 import type { MulticaConfig } from './config';
@@ -43,6 +44,7 @@ export interface PersonalAIRouterDeps {
   worker: TaskWorker;
   adapter: AgentExecutionAdapter | null;
   directRunner?: DirectExecutionRunner;
+  openClawRunner?: OpenClawAgentRunner;
 }
 
 interface RawBodyRequest extends ExpressRequest {
@@ -282,7 +284,9 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
     }
     let externalCancelled = false;
     if (before?.execution_mode === 'direct_llm') {
-      externalCancelled = deps.directRunner?.abort(req.params.id) ?? false;
+      const abortedDirect = deps.directRunner?.abort(req.params.id) ?? false;
+      const abortedOpenClaw = deps.openClawRunner?.abort(req.params.id) ?? false;
+      externalCancelled = abortedDirect || abortedOpenClaw;
     } else if (before?.external_task_id && deps.adapter?.cancelTask) {
       externalCancelled = await deps.adapter.cancelTask(
         before.external_task_id,
