@@ -19,6 +19,7 @@ import { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
 import { ZhiyiToolGateway } from './runtime/openclaw/tool-gateway';
 import { PersonalAIRuntime } from './runtime/personal-ai-runtime';
 import { createPersonalAIRouter } from './routes';
+import { executeImageGeneration } from '../upstream/media-handlers';
 import { BusinessTaskManager } from './task/business-task-manager';
 import { BusinessTaskRepository } from './task/business-task-repository';
 import { TaskManager } from './task/task-manager';
@@ -119,6 +120,18 @@ export function createPersonalAI(
     businessTaskManager,
     goalStore,
     logger: base.logger,
+    generateImages: (body, options) =>
+      executeImageGeneration(
+        {
+          config: base.config,
+          transport: base.transport,
+          logger: base.logger,
+          mediaStore: base.mediaStore,
+          upstream: base.upstream,
+        },
+        body,
+        options,
+      ),
   });
 
   const openClawRunner: OpenClawAgentRunner = new OpenClawAgentRunner({
@@ -145,6 +158,8 @@ export function createPersonalAI(
     taskManager,
     conversationStore,
     upstream: base.upstream,
+    mediaStore: base.mediaStore,
+    transport: base.transport,
     userProfiles,
     goalStore,
     projectStore,

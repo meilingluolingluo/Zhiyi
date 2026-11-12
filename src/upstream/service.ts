@@ -3,9 +3,15 @@
  * 运行期设置，保证设置页一改，所有模型请求立刻指向新的 API 与模型。
  */
 import type { AppConfig } from '../config';
-import { completionsUrl } from '../config';
+import {
+  buildUpstreamRequestForRoute,
+  resolveOneApiRoute,
+  resolveUpstreamModelId,
+  translateUpstreamResponse,
+  type ResolvedUpstreamProtocol,
+} from './oneapi-protocol';
 import type { Logger } from '../logger';
-import type { UpstreamTransport } from '../types';
+import type { ChatMessage, UpstreamTransport } from '../types';
 import { DucxAuth, type DucxStatus } from './ducx-auth';
 import {
   DucxReporter,
@@ -13,6 +19,10 @@ import {
   type DucxReportResult,
   type DucxReportStatus,
 } from './ducx-report';
+import {
+  MediaStore,
+  normalizeImageResponsePayload,
+} from './media-store';
 import {
   BAIDU_AVAILABLE_MODELS_PATH,
   DEFAULT_DUCX_EXECUTABLE,
@@ -73,6 +83,32 @@ export interface UpstreamServiceOptions {
   reportFetchImpl?: typeof fetch;
   /** 测试 / 私有部署：覆盖上报端点。 */
   reportBaseUrl?: string;
+  /** 可选图片媒体存储。 */
+  mediaStore?: MediaStore;
+}
+
+export interface ImageGenerationResult {
+  ok: boolean;
+  status: number;
+  model: string;
+  payload: Record<string, unknown>;
+  savedUrls: string[];
+  errorText?: string;
+}
+
+export interface TitleGenerationInput {
+  prompt?: string;
+  assistantReply?: string;
+  messages?: ChatMessage[];
+  model?: string;
+  maxLength?: number;
+  signal?: AbortSignal;
+}
+
+export interface TitleGenerationResult {
+  title: string;
+  model: string;
+  fallback: boolean;
 }
 
 export interface TestResult {
@@ -114,6 +150,9 @@ export function initialSettings(
     model: config.defaultModel,
     modelsPath: '/models',
     modelsSource: 'auto',
+    upstreamProtocol: 'auto',
+    imageModel: 'gpt-image-2',
+    titleModel: '',
     ducxReport: true,
     ducxExecutable: DEFAULT_DUCX_EXECUTABLE,
     modelOverride: 'settings',
@@ -131,6 +170,7 @@ export class UpstreamService {
   private readonly reportCaptureFn?: () => Promise<string>;
   private readonly reportFetchImpl?: typeof fetch;
   private readonly reportBaseUrl?: string;
+  private readonly mediaStore: MediaStore;
   private readonly ducxRuntimes = new Map<string, DucxAuth>();
   private readonly reportRuntimes = new Map<string, DucxReporter>();
   private modelCache: ModelCache | null = null;
@@ -145,6 +185,7 @@ export class UpstreamService {
     this.reportCaptureFn = options.reportCaptureFn;
     this.reportFetchImpl = options.reportFetchImpl;
     this.reportBaseUrl = options.reportBaseUrl;
+    this.mediaStore = options.mediaStore ?? new MediaStore(null);
   }
 
   view(): PublicSettings & {
@@ -345,6 +386,233 @@ export class UpstreamService {
     return response.json();
   }
 
+  private async dispatchWithAuthRetry(
+    resolved: ResolvedUpstream | null,
+    requestedModel: string | undefined,
+    apiKeyOverride: string | undefined,
+    sender: (headers: Record<string, string>) => Promise<Response>,
+  ): Promise<Response> {
+    const buildHeaders = (resolvedHeaders?: Record<string, string>): Record<string, string> => {
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (resolvedHeaders) {
+        Object.assign(headers, resolvedHeaders);
+      } else {
+        const key: string = apiKeyOverride || this.config.upstreamApiKey;
+        if (!this.config.mockUpstream && key !== '') {
+          headers.authorization = `Bearer ${key}`;
+        }
+      }
+      return headers;
+    };
+
+    let response: Response = await sender(buildHeaders(resolved?.headers));
+    if ((response.status === 401 || response.status === 403) && resolved?.authMode === 'ducx') {
+      resolved.onAuthRejected();
+      const refreshed: ResolvedUpstream | null = await this.resolveForRequest(requestedModel);
+      if (refreshed) {
+        response = await sender(buildHeaders(refreshed.headers));
+      }
+    }
+    return response;
+  }
+
+  /**
+   * 统一多协议对话发送入口（OpenAI Chat / Anthropic Messages / OpenAI Responses）：
+   * - 按设置页配置与模型名自动选路（支持 Baidu OneAPI 直连 + `-baidu-oneapi` slug 剥离）
+   * - 支持 DUCX 401/403 自动刷新重试
+   * - 将响应与 SSE 流统一规整为标准 OpenAI Chat Completions 格式返回给调用方
+   */
+  async sendChat(
+    openAiBody: Record<string, unknown>,
+    options: {
+      signal?: AbortSignal;
+      modelOverride?: string;
+      baseUrlOverride?: string;
+      apiKeyOverride?: string;
+    } = {},
+  ): Promise<{ response: Response; model: string; protocol: ResolvedUpstreamProtocol }> {
+    const requestedModel =
+      typeof options.modelOverride === 'string' && options.modelOverride.trim() !== ''
+        ? options.modelOverride.trim()
+        : typeof openAiBody.model === 'string' && openAiBody.model.trim() !== ''
+          ? openAiBody.model.trim()
+          : undefined;
+    const current: ModelSettings = this.store.get();
+    const resolved: ResolvedUpstream | null = await this.resolveForRequest(requestedModel);
+
+    const baseUrl: string =
+      resolved?.baseUrl ??
+      (normalizeBaseUrl(options.baseUrlOverride ?? '') ||
+        normalizeBaseUrl(this.config.upstreamBaseUrl));
+    const modelName: string =
+      resolved?.model || requestedModel || this.config.defaultModel;
+    const route = resolveOneApiRoute(baseUrl, modelName, current.upstreamProtocol ?? 'auto');
+
+    const response: Response = await this.dispatchWithAuthRetry(
+      resolved,
+      requestedModel,
+      options.apiKeyOverride,
+      async (headers: Record<string, string>): Promise<Response> => {
+        const built = buildUpstreamRequestForRoute(route, openAiBody, headers);
+        return this.transport(built.url, {
+          method: 'POST',
+          headers: built.headers,
+          body: built.body,
+          signal: options.signal,
+        });
+      },
+    );
+
+    const translated: Response = await translateUpstreamResponse(route.protocol, response, {
+      requestedModel: route.upstreamModel,
+      wantsStream: openAiBody.stream === true,
+    });
+    return { response: translated, model: modelName, protocol: route.protocol };
+  }
+
+  /**
+   * 统一生图出站调用：转发至 ${baseUrl}/v1/images/generations（如 Baidu OneAPI），
+   * 自动注入认证与 DUCX 401/403 重试，并将返回 base64 落盘/存库以生成可直接预览的 URL。
+   */
+  async generateImages(
+    openAiImageBody: Record<string, unknown>,
+    options: { signal?: AbortSignal; publicOrigin?: string } = {},
+  ): Promise<ImageGenerationResult> {
+    const current: ModelSettings = this.store.get();
+    const requestedModel =
+      typeof openAiImageBody.model === 'string' && openAiImageBody.model.trim() !== ''
+        ? openAiImageBody.model.trim()
+        : current.imageModel?.trim() || 'gpt-image-2';
+
+    const resolved: ResolvedUpstream | null = await this.resolveForRequest(requestedModel);
+    const baseUrl: string =
+      resolved?.baseUrl ?? normalizeBaseUrl(this.config.upstreamBaseUrl);
+    const upstreamModel: string = resolveUpstreamModelId(baseUrl, requestedModel);
+    const url: string = endpointUrl(baseUrl, '/v1/images/generations');
+
+    const prompt: string =
+      typeof openAiImageBody.prompt === 'string' ? openAiImageBody.prompt.trim() : '';
+    if (prompt !== '') {
+      void this.reportUsage({
+        sessionId: 'image-gen',
+        prompt,
+        cwd: process.cwd(),
+      }).catch((): void => undefined);
+    }
+
+    const bodyPayload: Record<string, unknown> = {
+      ...openAiImageBody,
+      model: upstreamModel,
+    };
+
+    const response: Response = await this.dispatchWithAuthRetry(
+      resolved,
+      requestedModel,
+      undefined,
+      async (headers: Record<string, string>): Promise<Response> =>
+        this.transport(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(bodyPayload),
+          signal: options.signal,
+        }),
+    );
+
+    if (!response.ok) {
+      const errorText: string = await response.text().catch((): string => '');
+      return {
+        ok: false,
+        status: response.status,
+        model: upstreamModel,
+        payload: {},
+        savedUrls: [],
+        errorText,
+      };
+    }
+
+    const rawJson = (await response.json()) as Record<string, unknown>;
+    const normalized = normalizeImageResponsePayload(rawJson, this.mediaStore, {
+      outputFormat: openAiImageBody.output_format,
+      publicOrigin: options.publicOrigin,
+      onError: (err): void => {
+        this.logger.warn('保存生成图片失败（保留原始 b64_json）', err);
+      },
+    });
+
+    return {
+      ok: true,
+      status: response.status,
+      model: upstreamModel,
+      payload: normalized.payload,
+      savedUrls: normalized.savedUrls,
+    };
+  }
+
+  /**
+   * 统一会话标题生成：优先调用轻量/当前模型总结简洁标题；异常或超时时自动平滑回退规则截断。
+   */
+  async generateTitle(input: TitleGenerationInput): Promise<TitleGenerationResult> {
+    const maxLen = Math.min(Math.max(4, input.maxLength ?? 20), 60);
+    const current: ModelSettings = this.store.get();
+    const resolved: ResolvedUpstream | null = await this.resolveForRequest(input.model);
+    const targetModel: string =
+      input.model?.trim() ||
+      current.titleModel?.trim() ||
+      resolved?.model ||
+      this.config.defaultModel;
+
+    const promptText: string = extractTitleSourceText(input);
+    const fallbackTitle: string = buildFallbackTitle(promptText, maxLen);
+    if (promptText === '' && (!input.assistantReply || input.assistantReply.trim() === '')) {
+      return { title: fallbackTitle, model: targetModel, fallback: true };
+    }
+
+    const userContext: string = [
+      promptText ? `用户消息：${promptText.slice(0, 600)}` : '',
+      input.assistantReply ? `助手回复：${input.assistantReply.slice(0, 800)}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    try {
+      const { response } = await this.sendChat(
+        {
+          model: targetModel,
+          messages: [
+            {
+              role: 'system',
+              content:
+                `你是对话标题提炼助手。请根据对话内容生成一个简洁、直观的标题（不超过 ${maxLen} 个字），` +
+                '保持与用户输入相同的语言，只输出标题本身，不要加引号、书名号、序号或句末标点。',
+            },
+            { role: 'user', content: userContext },
+          ],
+          stream: false,
+          temperature: 0.2,
+          max_tokens: 48,
+        },
+        {
+          modelOverride: targetModel,
+          signal: input.signal ?? AbortSignal.timeout(8_000),
+        },
+      );
+      if (!response.ok) {
+        return { title: fallbackTitle, model: targetModel, fallback: true };
+      }
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const rawTitle = data.choices?.[0]?.message?.content ?? '';
+      const cleaned = sanitizeGeneratedTitle(rawTitle, maxLen);
+      if (cleaned === '') {
+        return { title: fallbackTitle, model: targetModel, fallback: true };
+      }
+      return { title: cleaned, model: targetModel, fallback: false };
+    } catch {
+      return { title: fallbackTitle, model: targetModel, fallback: true };
+    }
+  }
+
   async testConnection(withChat: boolean): Promise<TestResult> {
     const started: number = Date.now();
     const current: ModelSettings = this.store.get();
@@ -364,22 +632,16 @@ export class UpstreamService {
       result.modelCount = models.length;
       result.ok = true;
       if (withChat) {
-        const resolved: ResolvedUpstream | null = await this.resolveForRequest();
-        const headers: Record<string, string> = {
-          'content-type': 'application/json',
-          ...(resolved?.headers ?? (await this.authHeaders())),
-        };
-        const response: Response = await this.transport(completionsUrl(baseUrl), {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            model: current.model || this.config.defaultModel,
+        const targetModel = current.model || this.config.defaultModel;
+        const { response } = await this.sendChat(
+          {
+            model: targetModel,
             messages: [{ role: 'user', content: '只回复两个字：正常' }],
             stream: false,
             max_tokens: 64,
-          }),
-          signal: AbortSignal.timeout(30_000),
-        });
+          },
+          { signal: AbortSignal.timeout(30_000), modelOverride: targetModel },
+        );
         result.status = response.status;
         const text: string = await response.text();
         if (!response.ok) throw new Error(`对话测试失败（HTTP ${response.status}）：${text.slice(0, 200)}`);
@@ -588,4 +850,38 @@ export function mergeModelLists(primary: ModelInfo[], extra: ModelInfo[]): Model
     result[at] = merged;
   }
   return result;
+}
+
+export function extractTitleSourceText(input: Pick<TitleGenerationInput, 'prompt' | 'messages'>): string {
+  if (typeof input.prompt === 'string' && input.prompt.trim() !== '') {
+    return input.prompt.trim();
+  }
+  if (!Array.isArray(input.messages)) return '';
+  for (const msg of input.messages) {
+    if (msg.role === 'user') {
+      const text = typeof msg.content === 'string' ? msg.content.trim() : '';
+      if (text !== '') return text;
+    }
+  }
+  return '';
+}
+
+export function buildFallbackTitle(sourceText: string, maxLength = 20): string {
+  const singleLine = sourceText.replace(/\s+/g, ' ').trim();
+  if (singleLine === '') return '新对话';
+  return singleLine.length > maxLength ? `${singleLine.slice(0, maxLength)}...` : singleLine;
+}
+
+export function sanitizeGeneratedTitle(raw: string, maxLength = 20): string {
+  let cleaned = (raw ?? '')
+    .split(/\r?\n/)[0]
+    .replace(/^#+\s*/, '')
+    .replace(/^标题[:：]\s*/i, '')
+    .replace(/^["'“”‘’《》【】\[\]]+|["'“”‘’《》【】\[\]。.！!？?：:；;]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cleaned.length > maxLength) {
+    cleaned = cleaned.slice(0, maxLength).trim();
+  }
+  return cleaned;
 }

@@ -3,10 +3,15 @@
  * 不重新实现模型供应商路由。MODEL_BASE_URL / MODEL_API_KEY 为可选覆盖，
  * 未设置时沿用 AppConfig 的 upstreamBaseUrl / upstreamApiKey。
  */
-import { completionsUrl, type AppConfig } from '../../../config';
+import type { AppConfig } from '../../../config';
 import type { Logger } from '../../../logger';
 import type { ChatMessage, UpstreamTransport } from '../../../types';
-import type { UpstreamService, ResolvedUpstream } from '../../../upstream/service';
+import {
+  buildUpstreamRequestForRoute,
+  resolveOneApiRoute,
+  translateUpstreamResponse,
+} from '../../../upstream/oneapi-protocol';
+import type { UpstreamService } from '../../../upstream/service';
 import type { PersonalAIConfig } from '../../config';
 
 export interface ModelAdapterDeps {
@@ -59,29 +64,13 @@ export class ModelAdapter {
     request: RawChatStreamRequest,
     options: { signal?: AbortSignal } = {},
   ): Promise<{ response: Response; model: string }> {
-    const resolved: ResolvedUpstream | null = this.deps.upstream
-      ? await this.deps.upstream.resolveForRequest(request.model)
-      : null;
-    const modelName: string = resolved?.model || request.model || this.deps.config.defaultModel;
-    const url: string = completionsUrl(resolved?.baseUrl ?? this.baseUrl());
-
-    const buildHeaders = (auth: Record<string, string>): Record<string, string> => {
-      const result: Record<string, string> = { 'content-type': 'application/json' };
-      if (resolved) Object.assign(result, auth);
-      else {
-        const key: string = this.apiKey();
-        if (!this.deps.config.mockUpstream && key !== '') result.authorization = `Bearer ${key}`;
-      }
-      return result;
-    };
-
     const timeout: AbortSignal = AbortSignal.timeout(this.deps.config.upstreamTimeoutMs);
     const signal: AbortSignal = options.signal
       ? (AbortSignal.any([options.signal, timeout]) as AbortSignal)
       : timeout;
 
     const payload: Record<string, unknown> = {
-      model: modelName,
+      model: request.model || this.deps.config.defaultModel,
       messages: request.messages,
       stream: true,
       stream_options: { include_usage: true },
@@ -93,17 +82,35 @@ export class ModelAdapter {
     if (typeof request.temperature === 'number') payload.temperature = request.temperature;
     if (typeof request.max_tokens === 'number') payload.max_tokens = request.max_tokens;
 
-    const body: string = JSON.stringify(payload);
-    const send = (headers: Record<string, string>): Promise<Response> =>
-      this.deps.transport(url, { method: 'POST', headers, body, signal });
+    let response: Response;
+    let modelName: string;
 
-    let response: Response = await send(buildHeaders(resolved?.headers ?? {}));
-    // DUCX 登录态过期时重新铸造一次认证头，与 codex-mixin 的刷新策略一致。
-    if ((response.status === 401 || response.status === 403) && resolved?.authMode === 'ducx') {
-      resolved.onAuthRejected();
-      const refreshed: ResolvedUpstream | null | undefined =
-        await this.deps.upstream?.resolveForRequest(request.model);
-      if (refreshed) response = await send(buildHeaders(refreshed.headers));
+    if (this.deps.upstream) {
+      const sent = await this.deps.upstream.sendChat(payload, {
+        signal,
+        modelOverride: request.model,
+        baseUrlOverride: this.deps.personalAI.modelBaseUrlOverride || undefined,
+        apiKeyOverride: this.deps.personalAI.modelApiKeyOverride || undefined,
+      });
+      response = sent.response;
+      modelName = sent.model;
+    } else {
+      modelName = request.model || this.deps.config.defaultModel;
+      const route = resolveOneApiRoute(this.baseUrl(), modelName, 'auto');
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      const key: string = this.apiKey();
+      if (!this.deps.config.mockUpstream && key !== '') headers.authorization = `Bearer ${key}`;
+      const built = buildUpstreamRequestForRoute(route, payload, headers);
+      const rawResponse = await this.deps.transport(built.url, {
+        method: 'POST',
+        headers: built.headers,
+        body: built.body,
+        signal,
+      });
+      response = await translateUpstreamResponse(route.protocol, rawResponse, {
+        requestedModel: route.upstreamModel,
+        wantsStream: true,
+      });
     }
 
     if (!response.ok || !response.body) {

@@ -20,6 +20,12 @@ import { DomainError } from './personal-ai/domain/types';
 import { handleChatCompletion } from './proxy';
 import { searchMemories } from './search';
 import {
+  executeImageGeneration,
+  executeTitleGeneration,
+  requestPublicOrigin,
+} from './upstream/media-handlers';
+import { isValidImageFilename } from './upstream/media-store';
+import {
   MEMORY_SCOPES,
   MEMORY_TYPES,
   type AgentAdminPatch,
@@ -402,6 +408,73 @@ export function createRouter(deps: AppDeps): Router {
   });
 
   // ===== 代理入口 =====
+  router.get('/v1/images/files/:filename', (req: ExpressRequest, res: ExpressResponse): void => {
+    const filename = String(req.params.filename ?? '').trim();
+    if (!isValidImageFilename(filename)) {
+      invalid(res, '非法图片文件名');
+      return;
+    }
+    const found = deps.mediaStore.read(filename);
+    if (!found) {
+      notFound(res, '图片文件');
+      return;
+    }
+    res.setHeader('Content-Type', found.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(found.data);
+  });
+
+  router.post('/v1/images/generations', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+    void (async (): Promise<void> => {
+      const body = bodyOf(req);
+      const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+      if (prompt === '') {
+        invalid(res, 'prompt 不能为空');
+        return;
+      }
+      const result = await executeImageGeneration(
+        {
+          config: deps.config,
+          transport: deps.transport,
+          logger: deps.logger,
+          mediaStore: deps.mediaStore,
+          upstream: deps.upstream,
+        },
+        body,
+        { publicOrigin: requestPublicOrigin(req) },
+      );
+      if (!result.ok) {
+        res
+          .status(result.status >= 400 ? result.status : 502)
+          .json(errorBody(result.errorText || '生图上游请求失败', 'upstream_error', 'upstream_error'));
+        return;
+      }
+      res.status(result.status).json(result.payload);
+    })().catch(next);
+  });
+
+  router.post('/v1/titles', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+    void (async (): Promise<void> => {
+      const body = bodyOf(req);
+      const result = await executeTitleGeneration(
+        {
+          config: deps.config,
+          transport: deps.transport,
+          upstream: deps.upstream,
+        },
+        {
+          prompt: typeof body.prompt === 'string' ? body.prompt : undefined,
+          assistantReply: typeof body.assistant_reply === 'string' ? body.assistant_reply : undefined,
+          messages: Array.isArray(body.messages) ? (body.messages as never) : undefined,
+          model: typeof body.model === 'string' ? body.model : undefined,
+          maxLength: typeof body.max_length === 'number' ? body.max_length : undefined,
+        },
+      );
+      res.json(result);
+    })().catch(next);
+  });
+
   router.post('/v1/chat/completions', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
     void handleChatCompletion(req, res, deps).catch(next);
   });

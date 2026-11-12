@@ -5,7 +5,7 @@
  * 注入记忆时只追加 messages，不改动任何其它字段或工具调用语义。
  */
 import type { Request as ExpressRequest, Response as ExpressResponse } from 'express';
-import { completionsUrl, type AppConfig } from './config';
+import type { AppConfig } from './config';
 import { buildMemoryContext, injectMemoryMessages } from './context';
 import { resolveIdentity, STRIPPED_BODY_FIELDS, type HeaderBag, type ResolvedIdentity } from './identity';
 import { errorBody } from './errors';
@@ -17,6 +17,11 @@ import type { TrajectoryStore } from './trajectories';
 import type { Logger } from './logger';
 import type { ChatMessage, UpstreamTransport } from './types';
 import { lastUserPrompt } from './upstream/ducx-report';
+import {
+  buildUpstreamRequestForRoute,
+  resolveOneApiRoute,
+  translateUpstreamResponse,
+} from './upstream/oneapi-protocol';
 import type { UpstreamService } from './upstream/service';
 
 export interface ProxyDeps {
@@ -178,26 +183,37 @@ export async function handleChatCompletion(
   const requestSnapshot: string = JSON.stringify(cleanBody);
   const model: string = String(cleanBody.model);
   const wantsStream: boolean = cleanBody.stream === true;
-  const url: string = completionsUrl(resolved?.baseUrl ?? deps.config.upstreamBaseUrl);
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (resolved) {
-    Object.assign(headers, resolved.headers);
-  } else if (deps.config.upstreamApiKey) {
-    headers.authorization = `Bearer ${deps.config.upstreamApiKey}`;
-  }
-
   const controller = new AbortController();
   const timer: ReturnType<typeof setTimeout> = setTimeout((): void => {
     controller.abort(new Error('upstream timeout'));
   }, deps.config.upstreamTimeoutMs);
 
   try {
-    const upstream: Response = await deps.transport(url, {
-      method: 'POST',
-      headers,
-      body: requestSnapshot,
-      signal: controller.signal,
-    });
+    let upstream: Response;
+    if (deps.upstream) {
+      const sent = await deps.upstream.sendChat(cleanBody, {
+        signal: controller.signal,
+        modelOverride: model,
+      });
+      upstream = sent.response;
+    } else {
+      const route = resolveOneApiRoute(deps.config.upstreamBaseUrl, model, 'auto');
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (deps.config.upstreamApiKey) {
+        headers.authorization = `Bearer ${deps.config.upstreamApiKey}`;
+      }
+      const built = buildUpstreamRequestForRoute(route, cleanBody, headers);
+      const rawUpstream = await deps.transport(built.url, {
+        method: 'POST',
+        headers: built.headers,
+        body: built.body,
+        signal: controller.signal,
+      });
+      upstream = await translateUpstreamResponse(route.protocol, rawUpstream, {
+        requestedModel: route.upstreamModel,
+        wantsStream,
+      });
+    }
 
     // 上游错误：原样回传状态码与响应体，并记录失败轨迹。
     if (!upstream.ok) {

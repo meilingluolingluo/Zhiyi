@@ -2,12 +2,17 @@
  * 后台记忆提取：进程内串行队列（setImmediate），不阻塞主链路。
  * 提取结果只写候选表，低置信度不自动进入正式记忆，必须人工 approve。
  */
-import { completionsUrl, type AppConfig } from './config';
+import type { AppConfig } from './config';
 import { ruleBasedExtract } from './extraction-rules';
 import type { MockUpstream } from './mock-upstream';
 import type { Logger } from './logger';
 import type { CandidateStore } from './candidates';
 import type { MemoryStore } from './memories';
+import {
+  buildUpstreamRequestForRoute,
+  resolveOneApiRoute,
+  translateUpstreamResponse,
+} from './upstream/oneapi-protocol';
 import type { UpstreamService } from './upstream/service';
 import type {
   ChatMessage,
@@ -138,13 +143,9 @@ export class ExtractionQueue {
       }
     }
 
-    // 与主链路共用运行期设置，避免切换 API 后提取器仍打旧地址。
-    const resolved = this.deps.upstream
-      ? await this.deps.upstream.resolveForRequest()
-      : null;
-    const url: string = completionsUrl(resolved?.baseUrl ?? this.deps.config.upstreamBaseUrl);
+    // 与主链路共用运行期设置与多协议路由，避免切换 API 后提取器仍打旧地址或不支持 OneAPI。
     const payload: Record<string, unknown> = {
-      model: resolved?.model ?? this.deps.config.defaultModel,
+      model: this.deps.config.defaultModel,
       temperature: 0,
       stream: false,
       response_format: { type: 'json_object' },
@@ -160,16 +161,27 @@ export class ExtractionQueue {
       ],
     };
     const send = async (body: Record<string, unknown>): Promise<Response> => {
+      if (this.deps.upstream) {
+        return (await this.deps.upstream.sendChat(body)).response;
+      }
+      const route = resolveOneApiRoute(
+        this.deps.config.upstreamBaseUrl,
+        String(body.model ?? this.deps.config.defaultModel),
+        'auto',
+      );
       const headers: Record<string, string> = { 'content-type': 'application/json' };
-      if (resolved) {
-        Object.assign(headers, resolved.headers);
-      } else if (this.deps.config.upstreamApiKey) {
+      if (this.deps.config.upstreamApiKey) {
         headers.authorization = `Bearer ${this.deps.config.upstreamApiKey}`;
       }
-      return this.deps.transport(url, {
+      const built = buildUpstreamRequestForRoute(route, body, headers);
+      const raw = await this.deps.transport(built.url, {
         method: 'POST',
-        headers,
-        body: JSON.stringify(body),
+        headers: built.headers,
+        body: built.body,
+      });
+      return translateUpstreamResponse(route.protocol, raw, {
+        requestedModel: route.upstreamModel,
+        wantsStream: false,
       });
     };
     try {

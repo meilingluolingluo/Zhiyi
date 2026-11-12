@@ -12,6 +12,7 @@ import type { MemoryStore } from '../../../memories';
 import { searchMemories } from '../../../search';
 import type { GoalStore } from '../../domain/goal-store';
 import type { BusinessTaskManager } from '../../task/business-task-manager';
+import type { ImageGenerationResult } from '../../../upstream/service';
 import type {
   ZhiyiPolicyDecision,
   ZhiyiToolContext,
@@ -24,6 +25,7 @@ export const DEFAULT_SAFE_OPENCLAW_TOOLS: readonly string[] = [
   'memory_search',
   'task_list',
   'goal_list',
+  'image_generate',
 ];
 
 const SECRET_VALUE_PATTERN =
@@ -55,6 +57,11 @@ export interface ZhiyiToolGatewayDeps {
   businessTaskManager: BusinessTaskManager;
   goalStore: GoalStore;
   logger: Logger;
+  /** 可选生图执行函数（经知忆统一生图链路直连 OneAPI，不暴露上游凭据）。 */
+  generateImages?: (
+    body: Record<string, unknown>,
+    options?: { signal?: AbortSignal; publicOrigin?: string },
+  ) => Promise<ImageGenerationResult>;
   /** 可选扩展：测试或显式受控工具注入（仍受 allowlist 与 PolicyChecker 约束）。 */
   extraTools?: ZhiyiToolDefinition[];
 }
@@ -268,6 +275,60 @@ export class ZhiyiToolGateway {
           .map((item) => `- ${item.id}: ${item.title} [${item.status}, P${item.priority}]`)
           .join('\n');
         return { text, details: { total: page.total } };
+      },
+    });
+
+    this.registerTool({
+      name: 'image_generate',
+      label: '文生图 / 图像生成',
+      description: '根据文本描述生成图片并返回可直接展示的 Markdown 图片链接。',
+      parameters: Type.Object(
+        {
+          prompt: Type.String({ minLength: 1, maxLength: 4000 }),
+          model: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+          size: Type.Optional(
+            Type.String({ enum: ['auto', '1024x1024', '1536x1024', '1024x1536'] }),
+          ),
+          quality: Type.Optional(Type.String({ enum: ['auto', 'low', 'medium', 'high'] })),
+          n: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+          output_format: Type.Optional(Type.String({ enum: ['png', 'jpeg', 'webp'] })),
+        },
+        { additionalProperties: false },
+      ),
+      execute: async (ctx, params, signal) => {
+        if (!this.deps.generateImages) {
+          throw new Error('当前网关未配置生图执行能力');
+        }
+        const promptText = String(params.prompt ?? '').trim();
+        const body: Record<string, unknown> = {
+          prompt: promptText,
+          n: typeof params.n === 'number' ? params.n : 1,
+          size: typeof params.size === 'string' ? params.size : '1024x1024',
+          quality: typeof params.quality === 'string' ? params.quality : 'medium',
+          output_format: typeof params.output_format === 'string' ? params.output_format : 'png',
+        };
+        if (typeof params.model === 'string' && params.model.trim() !== '') {
+          body.model = params.model.trim();
+        }
+        const res = await this.deps.generateImages(body, {
+          signal,
+          publicOrigin: ctx.publicOrigin,
+        });
+        if (!res.ok) {
+          throw new Error(
+            redactSensitiveText(`生图失败（HTTP ${res.status}）：${res.errorText ?? ''}`.slice(0, 300)),
+          );
+        }
+        if (res.savedUrls.length === 0) {
+          return { text: '上游未返回有效图片 URL 或 base64 数据。', details: { model: res.model, count: 0 } };
+        }
+        const markdown = res.savedUrls
+          .map((u, idx) => `![${promptText.slice(0, 60)}${res.savedUrls.length > 1 ? ` #${idx + 1}` : ''}](${u})`)
+          .join('\n\n');
+        return {
+          text: `已使用模型 ${res.model} 生成 ${res.savedUrls.length} 张图片，请在最终回复中原样包含以下 Markdown 图片：\n\n${markdown}`,
+          details: { model: res.model, urls: res.savedUrls },
+        };
       },
     });
   }

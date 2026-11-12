@@ -28,6 +28,11 @@ import {
 import type { PersonalAIConfig, PersonalAIProtocol } from './config';
 import type { PersonalAIEvent } from './events/event-types';
 import { resolvePersonalAIIdentity, type HeaderBag, type PersonalAIIdentity } from './identity/identity-manager';
+import {
+  executeImageGeneration,
+  executeTitleGeneration,
+  requestPublicOrigin,
+} from '../upstream/media-handlers';
 import type { PersonalAIRuntime } from './runtime/personal-ai-runtime';
 import type { DirectExecutionRunner } from './runtime/direct-execution-runner';
 import type { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
@@ -135,6 +140,7 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
         : model;
 
     const headerTimezone: string | undefined = req.header('x-timezone') ?? undefined;
+    const publicOrigin: string | undefined = requestPublicOrigin(req);
 
     // ADP 的 OpenAICompatible vendor 固定 stream:true；这里也支持 stream:false 便于调试。
     if (body.stream === false) {
@@ -147,6 +153,7 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
         model,
         timezone: headerTimezone,
         usage,
+        publicOrigin,
       })) {
         if (event.type === 'text_delta' || event.type === 'final_answer') text += event.content;
         else if (event.type === 'error') {
@@ -192,6 +199,7 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
         model,
         timezone: headerTimezone,
         signal: controller.signal,
+        publicOrigin,
       })) {
         if (clientGone) break;
         for (const frame of encodeEvent(event, ctx)) res.write(frame);
@@ -226,10 +234,12 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
     sseHeaders(res);
     const ctx = createProtocolContext('adp-v2', deps.base.config.defaultModel, auth.identity.conversation_id);
     const headerTimezone: string | undefined = req.header('x-timezone') ?? undefined;
+    const publicOrigin: string | undefined = requestPublicOrigin(req);
     for await (const event of deps.runtime.run({
       identity: auth.identity,
       messages,
       timezone: headerTimezone,
+      publicOrigin,
     })) {
       for (const frame of encodeEvent(event, ctx)) {
         // 防御性校验：绝不向前端发送未经验证的自定义事件类型。
@@ -240,6 +250,72 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
       }
     }
     res.end();
+  });
+
+  /** Personal AI 生图代理端点（兼容 OpenAI /images/generations 契约）。 */
+  router.post('/v1/personal-ai/images/generations', async (req, res): Promise<void> => {
+    const auth = identify(req, deps);
+    if (!auth.ok) {
+      authFailure(res, auth.status, auth.error);
+      return;
+    }
+    if (!deps.config.enabled) {
+      authFailure(res, 503, '知忆未启用（PERSONAL_AI_ENABLED=false）');
+      return;
+    }
+    const body = bodyOf(req);
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (prompt === '') {
+      authFailure(res, 400, 'prompt 不能为空');
+      return;
+    }
+    const result = await executeImageGeneration(
+      {
+        config: deps.base.config,
+        transport: deps.base.transport,
+        logger: deps.base.logger,
+        mediaStore: deps.base.mediaStore,
+        upstream: deps.base.upstream,
+      },
+      body,
+      { publicOrigin: requestPublicOrigin(req) },
+    );
+    if (!result.ok) {
+      res
+        .status(result.status >= 400 ? result.status : 502)
+        .json(errorBody(result.errorText || '生图上游请求失败', 'upstream_error', 'upstream_error'));
+      return;
+    }
+    res.status(result.status).json(result.payload);
+  });
+
+  /** Personal AI 会话标题提炼端点（供 ADP 等客户端新建会话后自动生成简短标题）。 */
+  router.post('/v1/personal-ai/titles', async (req, res): Promise<void> => {
+    const auth = identify(req, deps);
+    if (!auth.ok) {
+      authFailure(res, auth.status, auth.error);
+      return;
+    }
+    if (!deps.config.enabled) {
+      authFailure(res, 503, '知忆未启用（PERSONAL_AI_ENABLED=false）');
+      return;
+    }
+    const body = bodyOf(req);
+    const result = await executeTitleGeneration(
+      {
+        config: deps.base.config,
+        transport: deps.base.transport,
+        upstream: deps.base.upstream,
+      },
+      {
+        prompt: typeof body.prompt === 'string' ? body.prompt : undefined,
+        assistantReply: typeof body.assistant_reply === 'string' ? body.assistant_reply : undefined,
+        messages: Array.isArray(body.messages) ? (body.messages as never) : undefined,
+        model: typeof body.model === 'string' ? body.model : undefined,
+        maxLength: typeof body.max_length === 'number' ? body.max_length : undefined,
+      },
+    );
+    res.json(result);
   });
 
   router.get('/v1/personal-ai/tasks', (req, res): void => {

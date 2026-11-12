@@ -14,8 +14,10 @@ import type { ExtractionQueue } from '../../extractor';
 import type { Logger } from '../../logger';
 import type { MemoryStore } from '../../memories';
 import type { TrajectoryStore } from '../../trajectories';
-import type { AgentProfile, ChatMessage } from '../../types';
+import type { AgentProfile, ChatMessage, UpstreamTransport } from '../../types';
 import { lastUserPrompt } from '../../upstream/ducx-report';
+import { executeImageGeneration } from '../../upstream/media-handlers';
+import { isImageGenerationModel, type MediaStore } from '../../upstream/media-store';
 import type { UpstreamService } from '../../upstream/service';
 import type { ModelAdapter, TokenUsage } from '../adapters/model/model-adapter';
 import type { PersonalAIConfig } from '../config';
@@ -58,8 +60,10 @@ export interface RuntimeDeps {
   worker: TaskWorker;
   taskManager: TaskManager;
   conversationStore: ConversationContextStore;
-  /** 运行期模型服务设置；用于 DUCX 来源上报（可选）。 */
+  /** 运行期模型服务设置；用于 DUCX 来源上报与生图（可选）。 */
   upstream?: UpstreamService;
+  mediaStore?: MediaStore;
+  transport?: UpstreamTransport;
   /** V1.5 个人事务与执行编排依赖（可选，不传时保持纯粹 V1 兼容行为）。 */
   userProfiles?: UserProfileStore;
   goalStore?: GoalStore;
@@ -79,6 +83,20 @@ export interface RunInput {
   timezone?: string;
   /** 可选：传入后由 Runtime 回填上游返回的 token usage（非流式响应使用）。 */
   usage?: TokenUsage;
+  /** 可选公共访问前缀（用于生成可被浏览器访问的图片 URL）。 */
+  publicOrigin?: string;
+}
+
+const EXPLICIT_IMAGE_GEN_RE =
+  /^(?:(?:请|麻烦|帮我|给我|帮忙|为我)\s*){0,3}(?:(?:画|绘制)(?:(?:一[张幅只条个名组])|.*(?:图|图片|照片|插画|海报|头像|壁纸|漫画|logo|sketch|image|picture))|(?:生成|创作)(?:一?张|一?幅|一?个|张|幅|个)?.*(?:图|图片|照片|插画|海报|头像|壁纸|漫画|logo|image|picture))/i;
+
+function isExplicitImageGenerationRequest(text: string): boolean {
+  const cleaned = text.trim();
+  if (cleaned === '' || cleaned.length > 500) return false;
+  return (
+    EXPLICIT_IMAGE_GEN_RE.test(cleaned) ||
+    /^(?:draw|generate|create)\s+(?:an?\s+)?(?:image|picture|photo|illustration|avatar|logo|poster)\b/i.test(cleaned)
+  );
 }
 
 function sleep(ms: number): Promise<void> {
@@ -242,7 +260,47 @@ export class PersonalAIRuntime {
     signal: AbortSignal | undefined,
     usageOut: TokenUsage | undefined,
     capture: { text: string },
+    publicOrigin?: string,
   ): AsyncGenerator<PersonalAIEvent> {
+    const effectiveModel = modelName || this.deps.config.defaultModel;
+    const shouldGenerateImage =
+      Boolean(this.deps.mediaStore && this.deps.transport) &&
+      (isImageGenerationModel(effectiveModel) ||
+        (!this.deps.config.mockUpstream &&
+          Boolean(this.deps.upstream) &&
+          isExplicitImageGenerationRequest(context.taskText)));
+
+    if (shouldGenerateImage && this.deps.mediaStore && this.deps.transport) {
+      const imageBody: Record<string, unknown> = { prompt: context.taskText };
+      if (isImageGenerationModel(effectiveModel)) {
+        imageBody.model = effectiveModel;
+      }
+      const res = await executeImageGeneration(
+        {
+          config: this.deps.config,
+          transport: this.deps.transport,
+          logger: this.deps.logger,
+          mediaStore: this.deps.mediaStore,
+          upstream: this.deps.upstream,
+        },
+        imageBody,
+        { signal, publicOrigin },
+      );
+      if (!res.ok) {
+        throw new Error(`模型上游返回 ${res.status}：${res.errorText ?? '生图失败'}`);
+      }
+      const markdown =
+        res.savedUrls.length > 0
+          ? `已使用模型 \`${res.model}\` 生成图片：\n\n` +
+            res.savedUrls
+              .map((u, idx) => `![${oneLine(context.taskText, 40) || 'image'}${res.savedUrls.length > 1 ? ` #${idx + 1}` : ''}](${u})`)
+              .join('\n\n')
+          : '生图接口未返回有效图片。';
+      capture.text += markdown;
+      yield { type: 'text_delta', content: markdown };
+      return;
+    }
+
     for await (const delta of this.deps.modelAdapter.stream(context.messages, {
       model: modelName,
       signal,
@@ -335,6 +393,7 @@ export class PersonalAIRuntime {
     signal: AbortSignal | undefined,
     usageOut: TokenUsage | undefined,
     capture: { text: string },
+    publicOrigin?: string,
   ): AsyncGenerator<PersonalAIEvent> {
     this.deps.conversationStore.touch(identity, execution.id);
     yield { type: 'task_started', taskId: execution.id };
@@ -351,6 +410,7 @@ export class PersonalAIRuntime {
             prebuiltSystemMessage,
             signal,
             modelOverride: modelName,
+            publicOrigin,
             onUsage: (usage: TokenUsage): void => {
               if (usageOut) {
                 usageOut.prompt_tokens += usage.prompt_tokens;
@@ -419,6 +479,7 @@ export class PersonalAIRuntime {
     signal: AbortSignal | undefined,
     usageOut: TokenUsage | undefined,
     capture: { text: string },
+    publicOrigin?: string,
   ): AsyncGenerator<PersonalAIEvent> {
     if (prepared.execution.execution_mode === 'direct_llm') {
       if (prepared.created && prepared.businessTask && prepared.agent) {
@@ -432,6 +493,7 @@ export class PersonalAIRuntime {
           signal,
           usageOut,
           capture,
+          publicOrigin,
         );
         return;
       }
@@ -605,7 +667,14 @@ export class PersonalAIRuntime {
         this.deps.logger.info(
           `[personal-ai] mode=direct_llm reason=${structured.reason} memory=${context.memoryInjected ? 'on' : 'off'}`,
         );
-        yield* this.streamOrdinaryDirectLlm(context, modelName, input.signal, input.usage, capture);
+        yield* this.streamOrdinaryDirectLlm(
+          context,
+          modelName,
+          input.signal,
+          input.usage,
+          capture,
+          input.publicOrigin,
+        );
         return;
       }
 
@@ -627,7 +696,14 @@ export class PersonalAIRuntime {
           this.deps.logger.info(
             '[personal-ai] mode=direct_llm reason=无可用Agent且MULTICA_ENABLED=false，降级直接回答',
           );
-          yield* this.streamOrdinaryDirectLlm(context, modelName, input.signal, input.usage, capture);
+          yield* this.streamOrdinaryDirectLlm(
+            context,
+            modelName,
+            input.signal,
+            input.usage,
+            capture,
+            input.publicOrigin,
+          );
           return;
         }
 
@@ -655,6 +731,7 @@ export class PersonalAIRuntime {
           input.signal,
           input.usage,
           capture,
+          input.publicOrigin,
         );
         return;
       }
@@ -690,6 +767,7 @@ export class PersonalAIRuntime {
           input.signal,
           input.usage,
           capture,
+          input.publicOrigin,
         );
         return;
       }
@@ -702,7 +780,14 @@ export class PersonalAIRuntime {
         this.deps.logger.info(
           `[personal-ai] mode=direct_llm reason=${plan.reason} memory=${context.memoryInjected ? 'on' : 'off'}`,
         );
-        yield* this.streamOrdinaryDirectLlm(context, modelName, input.signal, input.usage, capture);
+        yield* this.streamOrdinaryDirectLlm(
+          context,
+          modelName,
+          input.signal,
+          input.usage,
+          capture,
+          input.publicOrigin,
+        );
         return;
       }
 
@@ -733,6 +818,7 @@ export class PersonalAIRuntime {
         input.signal,
         input.usage,
         capture,
+        input.publicOrigin,
       );
     } catch (error) {
       const message: string = error instanceof Error ? error.message : String(error);

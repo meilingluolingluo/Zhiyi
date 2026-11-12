@@ -1,5 +1,6 @@
 /** 应用装配：把配置、数据库、各 Store、Mock 上游与路由组合成一个 Express 应用。 */
 import express, { type Express } from 'express';
+import path from 'node:path';
 import { AgentStore } from './agents';
 import { BackgroundTracker } from './background';
 import { CandidateStore } from './candidates';
@@ -14,6 +15,7 @@ import type { PersonalAIConfig } from './personal-ai/config';
 import { createRouter, errorMiddleware } from './routes';
 import { TrajectoryStore } from './trajectories';
 import { createSettingsRouter } from './upstream/routes';
+import { MediaStore } from './upstream/media-store';
 import { SettingsStore } from './upstream/model-settings';
 import { initialSettings, UpstreamService } from './upstream/service';
 import type { UpstreamTransport } from './types';
@@ -30,6 +32,8 @@ export interface AppDeps {
   mock: MockUpstream | null;
   transport: UpstreamTransport;
   logger: Logger;
+  /** 生成图片的读写存储（测试纯内存，运行期写 data/generated-images）。 */
+  mediaStore: MediaStore;
   /** 运行期模型服务设置（自填 API / 自选模型 / DUCX）。 */
   upstream?: UpstreamService;
   /** 管理员接口令牌（来源于 options.adminToken ?? config.settingsToken）。 */
@@ -97,6 +101,9 @@ export async function createApp(
     baseUrl: config.mockUpstream ? undefined : process.env.MODEL_BASE_URL || undefined,
     apiKey: config.mockUpstream ? undefined : process.env.MODEL_API_KEY || undefined,
   });
+  const mediaStore = new MediaStore(
+    settingsPath ? path.join(path.dirname(settingsPath), 'generated-images') : null,
+  );
   const upstream: UpstreamService | null =
     options.upstreamSettings === null
       ? null
@@ -108,6 +115,7 @@ export async function createApp(
           transport,
           logger,
           ducxCaptureFn: options.ducxCaptureFn,
+          mediaStore,
         }));
 
   const queue = new ExtractionQueue({
@@ -132,6 +140,7 @@ export async function createApp(
     mock,
     transport,
     logger,
+    mediaStore,
     upstream: upstream ?? undefined,
     adminToken,
   };

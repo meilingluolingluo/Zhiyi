@@ -30,6 +30,7 @@ export interface CreateOpenClawAgentParams {
   onUsage?: (usage: TokenUsage) => void;
   maxContextTokens?: number;
   getTurnCount: () => number;
+  publicOrigin?: string;
 }
 
 export function buildZhiyiModelDescriptor(modelName: string): Model {
@@ -56,6 +57,7 @@ export function createZhiyiOpenClawAgent(params: CreateOpenClawAgentParams): Age
     execution: params.execution,
     identity: params.identity,
     allowedTools,
+    publicOrigin: params.publicOrigin,
   };
 
   const configuredMaxTurns = params.agentProfile.backend_config?.max_turns;

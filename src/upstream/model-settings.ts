@@ -13,6 +13,7 @@ export type AuthMode = 'api_key' | 'ducx' | 'none';
 export type ModelOverride = 'settings' | 'request';
 /** auto = 合并 /v1/models 与 Baidu /openapi/v2/available_models；single = 只用 modelsPath。 */
 export type ModelsSource = 'auto' | 'single';
+export type UpstreamProtocol = 'auto' | 'openai_chat' | 'anthropic_messages' | 'openai_responses';
 
 export interface ModelSettings {
   /** 是否覆盖 .env 中的静态上游配置。Mock 模式与测试默认 false。 */
@@ -25,6 +26,12 @@ export interface ModelSettings {
   modelsPath: string;
   /** 是否额外合并 Baidu 富信息模型列表（可以拿到 /v1/models 之外的 auto 等模型）。 */
   modelsSource: ModelsSource;
+  /** 上游出站协议：auto 按 URL/模型自动选路（Baidu OneAPI 走 /v1/messages 或 /v1/responses）。 */
+  upstreamProtocol?: UpstreamProtocol;
+  /** 可选生图模型（如 gpt-image-2）；为空时默认 gpt-image-2。 */
+  imageModel?: string;
+  /** 可选标题生成模型；为空时沿用当前默认对话模型。 */
+  titleModel?: string;
   /** 是否向 DUCX data-report 上报来源（避免 OneAPI 判定未知来源）。 */
   ducxReport: boolean;
   ducxExecutable: string;
@@ -117,6 +124,12 @@ export function modelsUrl(baseUrl: string, modelsPath: string): string {
 const AUTH_MODES: readonly AuthMode[] = ['api_key', 'ducx', 'none'];
 const OVERRIDES: readonly ModelOverride[] = ['settings', 'request'];
 const MODELS_SOURCES: readonly ModelsSource[] = ['auto', 'single'];
+const UPSTREAM_PROTOCOLS: readonly UpstreamProtocol[] = [
+  'auto',
+  'openai_chat',
+  'anthropic_messages',
+  'openai_responses',
+];
 
 export function validateSettingsPatch(patch: SettingsPatch): string[] {
   const errors: string[] = [];
@@ -142,6 +155,18 @@ export function validateSettingsPatch(patch: SettingsPatch): string[] {
   }
   if (patch.modelsSource !== undefined && !MODELS_SOURCES.includes(patch.modelsSource)) {
     errors.push('模型列表来源必须是 auto / single');
+  }
+  if (
+    patch.upstreamProtocol !== undefined &&
+    !UPSTREAM_PROTOCOLS.includes(patch.upstreamProtocol)
+  ) {
+    errors.push('上游协议必须是 auto / openai_chat / anthropic_messages / openai_responses');
+  }
+  if (patch.imageModel !== undefined && typeof patch.imageModel === 'string' && patch.imageModel.trim().length > 200) {
+    errors.push('生图模型名称不能超过 200 字符');
+  }
+  if (patch.titleModel !== undefined && typeof patch.titleModel === 'string' && patch.titleModel.trim().length > 200) {
+    errors.push('标题生成模型名称不能超过 200 字符');
   }
   if (patch.modelsPath !== undefined) {
     const value: string = patch.modelsPath.trim();
@@ -172,6 +197,9 @@ export interface PublicSettings {
   model: string;
   modelsPath: string;
   modelsSource: ModelsSource;
+  upstreamProtocol: UpstreamProtocol;
+  imageModel: string;
+  titleModel: string;
   ducxReport: boolean;
   ducxExecutable: string;
   modelOverride: ModelOverride;
@@ -188,6 +216,9 @@ export function toPublicSettings(settings: ModelSettings): PublicSettings {
     model: settings.model,
     modelsPath: settings.modelsPath,
     modelsSource: settings.modelsSource,
+    upstreamProtocol: settings.upstreamProtocol ?? 'auto',
+    imageModel: settings.imageModel ?? 'gpt-image-2',
+    titleModel: settings.titleModel ?? '',
     ducxReport: settings.ducxReport,
     ducxExecutable: settings.ducxExecutable,
     modelOverride: settings.modelOverride,
@@ -225,6 +256,17 @@ export class SettingsStore {
             modelsSource: MODELS_SOURCES.includes(stored.modelsSource as ModelsSource)
               ? (stored.modelsSource as ModelsSource)
               : initial.modelsSource,
+            upstreamProtocol: UPSTREAM_PROTOCOLS.includes(stored.upstreamProtocol as UpstreamProtocol)
+              ? (stored.upstreamProtocol as UpstreamProtocol)
+              : (initial.upstreamProtocol ?? 'auto'),
+            imageModel:
+              typeof stored.imageModel === 'string'
+                ? stored.imageModel.trim()
+                : (initial.imageModel ?? 'gpt-image-2'),
+            titleModel:
+              typeof stored.titleModel === 'string'
+                ? stored.titleModel.trim()
+                : (initial.titleModel ?? ''),
             ducxReport: typeof stored.ducxReport === 'boolean' ? stored.ducxReport : initial.ducxReport,
           };
         }

@@ -117,6 +117,7 @@ export class OpenClawAgentRunner {
       onUsage: options.onUsage,
       maxContextTokens: options.maxContextTokens,
       getTurnCount: () => currentTurns,
+      publicOrigin: options.publicOrigin,
     });
 
     this.activeRuns.set(execution.id, { agent, controller });

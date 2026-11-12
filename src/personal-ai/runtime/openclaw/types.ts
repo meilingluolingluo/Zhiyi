@@ -25,6 +25,8 @@ export interface ZhiyiToolContext {
   execution: ExecutionTask;
   identity: PersonalAIIdentity;
   allowedTools: ReadonlySet<string>;
+  /** 可选公共访问前缀（用于拼接生图 URL）。 */
+  publicOrigin?: string;
 }
 
 export interface ZhiyiToolExecutionResult {
@@ -59,6 +61,8 @@ export interface OpenClawRunOptions {
   rethrowOnError?: boolean;
   /** 可选上下文裁剪上限（估计 token 数）。 */
   maxContextTokens?: number;
+  /** 可选公共访问前缀（供生图工具返回可浏览器访问的图片链接）。 */
+  publicOrigin?: string;
 }
 
 export interface OpenClawAgentRunnerDeps {
