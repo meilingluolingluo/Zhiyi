@@ -1,0 +1,668 @@
+/**
+ * Personal AI Runtime：唯一的智能决策中心与编排入口。
+ *
+ * 流程：身份 → 用户档案 → 会话 → 统一 Context（记忆 + 目标/项目/任务摘要）→
+ *       意图（规则快路径 / 可选单步 LLM 结构化意图）→ 计划 & Agent 选择 →
+ *       事务记录创建（Goal/Project/Task）或 Direct/MultiCA 执行 → 统一事件流 → 轨迹/候选记忆。
+ *
+ * 长时间 MultiCA 任务由后台 Worker 执行；客户端断开（signal aborted）时停止发事件，但后台任务继续。
+ */
+import type { AgentStore } from '../../agents';
+import type { BackgroundTracker } from '../../background';
+import type { AppConfig } from '../../config';
+import type { ExtractionQueue } from '../../extractor';
+import type { Logger } from '../../logger';
+import type { MemoryStore } from '../../memories';
+import type { TrajectoryStore } from '../../trajectories';
+import type { AgentProfile, ChatMessage } from '../../types';
+import { lastUserPrompt } from '../../upstream/ducx-report';
+import type { UpstreamService } from '../../upstream/service';
+import type { ModelAdapter, TokenUsage } from '../adapters/model/model-adapter';
+import type { PersonalAIConfig } from '../config';
+import type { ConversationContextStore } from '../conversation/conversation-context';
+import type { GoalStore } from '../domain/goal-store';
+import type { ProjectStore } from '../domain/project-store';
+import type { BusinessTask } from '../domain/types';
+import type { UserProfileStore } from '../domain/user-profile-store';
+import type { PersonalAIEvent } from '../events/event-types';
+import type { PersonalAIIdentity } from '../identity/identity-manager';
+import type { BusinessTaskManager } from '../task/business-task-manager';
+import type { TaskManager } from '../task/task-manager';
+import type { ExecutionTask } from '../task/task-repository';
+import type { TaskWorker } from '../worker/task-worker';
+import type { AgentSelector } from './agent-selector';
+import { buildPersonalAIContext, type BuiltContext } from './context-builder';
+import type { DirectExecutionRunner } from './direct-execution-runner';
+import { planExecution } from './execution-planner';
+import {
+  buildIntentClassificationPrompt,
+  isGreetingOnly,
+  parseStructuredIntent,
+  understandIntent,
+  type StructuredIntent,
+} from './intent-understanding';
+import { aggregateAgentResult } from './result-aggregator';
+
+export interface RuntimeDeps {
+  config: AppConfig;
+  personalAI: PersonalAIConfig;
+  agentStore: AgentStore;
+  memoryStore: MemoryStore;
+  trajectoryStore: TrajectoryStore;
+  queue: ExtractionQueue;
+  background: BackgroundTracker;
+  logger: Logger;
+  modelAdapter: ModelAdapter;
+  worker: TaskWorker;
+  taskManager: TaskManager;
+  conversationStore: ConversationContextStore;
+  /** 运行期模型服务设置；用于 DUCX 来源上报（可选）。 */
+  upstream?: UpstreamService;
+  /** V1.5 个人事务与执行编排依赖（可选，不传时保持纯粹 V1 兼容行为）。 */
+  userProfiles?: UserProfileStore;
+  goalStore?: GoalStore;
+  projectStore?: ProjectStore;
+  businessTaskManager?: BusinessTaskManager;
+  agentSelector?: AgentSelector;
+  directRunner?: DirectExecutionRunner;
+}
+
+export interface RunInput {
+  identity: PersonalAIIdentity;
+  messages: ChatMessage[];
+  model?: string;
+  signal?: AbortSignal;
+  /** 可选：来自请求头的 IANA 时区，按 user > header > default 惰性同步。 */
+  timezone?: string;
+  /** 可选：传入后由 Runtime 回填上游返回的 token usage（非流式响应使用）。 */
+  usage?: TokenUsage;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve): void => {
+    const timer: ReturnType<typeof setTimeout> = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+function oneLine(text: string, max: number): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+export class PersonalAIRuntime {
+  constructor(private readonly deps: RuntimeDeps) {}
+
+  private scheduleTrajectory(
+    identity: PersonalAIIdentity,
+    messages: ChatMessage[],
+    assistantText: string,
+    model: string | undefined,
+  ): void {
+    if (assistantText.trim() === '') return;
+    this.deps.background.run(async (): Promise<void> => {
+      try {
+        const saved = this.deps.trajectoryStore.save({
+          request_id: identity.request_id,
+          user_id: identity.user_id,
+          agent_id: identity.agent_id,
+          session_id: identity.session_id,
+          task_id: identity.task_id,
+          project_id: identity.project_id,
+          model: model || this.deps.config.defaultModel,
+          request: JSON.stringify({ messages }),
+          response: assistantText,
+          status: 'ok',
+        });
+        if (!saved.inserted || !this.deps.config.memoryAutoExtract) return;
+        this.deps.queue.enqueue({
+          trajectory: saved.record,
+          messages,
+          assistantText,
+          source: 'auto-extract',
+        });
+      } catch (error) {
+        this.deps.logger.error('[personal-ai] 轨迹保存失败（不影响对话）', error);
+      }
+    });
+  }
+
+  private async tryClassifyIntent(
+    context: BuiltContext,
+    model: string | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<StructuredIntent | null> {
+    if (!this.deps.personalAI.llmIntentEnabled || isGreetingOnly(context.taskText)) {
+      return null;
+    }
+
+    const agents: AgentProfile[] = this.deps.agentStore
+      .list()
+      .filter((a): boolean => a.status === 'active');
+    const agentSummaries: string[] = agents.map(
+      (a): string => `${a.agent_id}(${a.role || a.name}; backend=${a.execution_backend}; caps=${a.capabilities.join(',')})`,
+    );
+    const projectSummaries: string[] = (context.activeProjects ?? []).map(
+      (p): string => `${p.id}:${p.title}`,
+    );
+    const goalSummaries: string[] = (context.activeGoals ?? []).map(
+      (g): string => `${g.id}:${g.title}`,
+    );
+
+    const prompt: string = buildIntentClassificationPrompt(
+      context.taskText,
+      agentSummaries,
+      projectSummaries,
+      goalSummaries,
+    );
+    try {
+      const raw: string = await this.deps.modelAdapter.complete(
+        [{ role: 'user', content: prompt }],
+        { model, signal },
+      );
+      const parsed: StructuredIntent | null = parseStructuredIntent(raw);
+      if (!parsed) {
+        this.deps.logger.info('[personal-ai] LLM 意图解析未通过校验，回退 V1 规则路由');
+      }
+      return parsed;
+    } catch (error) {
+      this.deps.logger.warn(
+        `[personal-ai] LLM 意图分类调用异常，回退 V1 规则路由: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
+  }
+
+  private resolveExplicitPreferredAgent(identity: PersonalAIIdentity, intentAgent?: string): string | undefined {
+    if (intentAgent && intentAgent.trim() !== '') return intentAgent.trim();
+    const idAgent: string = (identity.agent_id ?? '').trim();
+    if (idAgent !== '' && idAgent !== 'default') return idAgent;
+    return undefined;
+  }
+
+  private prepareExecutionRecord(
+    identity: PersonalAIIdentity,
+    title: string,
+    description: string,
+    selectedAgent: AgentProfile | null,
+    explicitProjectId: string | null,
+    timezone?: string,
+  ): {
+    businessTask: BusinessTask | null;
+    execution: ExecutionTask;
+    agent: AgentProfile | null;
+    created: boolean;
+  } {
+    const targetProjectId: string | null =
+      explicitProjectId ??
+      (identity.project_id && identity.project_id !== 'default' ? identity.project_id : null);
+
+    if (this.deps.businessTaskManager) {
+      const prepared = this.deps.businessTaskManager.prepareAdhocDelegation({
+        userId: identity.user_id,
+        conversationId: identity.conversation_id,
+        requestId: identity.request_id,
+        title,
+        description,
+        agentId: selectedAgent?.agent_id ?? null,
+        projectId: targetProjectId,
+        multicaEnabled: this.deps.personalAI.multica.enabled,
+        userOptions: { headerTimezone: timezone },
+      });
+      return {
+        businessTask: prepared.task,
+        execution: prepared.execution,
+        agent: prepared.agent,
+        created: prepared.created,
+      };
+    }
+
+    const fallbackCreated = this.deps.taskManager.createIfAbsent({
+      user_id: identity.user_id,
+      conversation_id: identity.conversation_id,
+      request_id: identity.request_id,
+      agent_id: selectedAgent?.agent_id ?? (this.deps.personalAI.multica.defaultAgent || null),
+      project_id: targetProjectId,
+      execution_mode: selectedAgent?.execution_backend === 'direct_llm' ? 'direct_llm' : 'agent_delegation',
+      input_summary: description,
+    });
+    return {
+      businessTask: null,
+      execution: fallbackCreated.task,
+      agent: selectedAgent,
+      created: fallbackCreated.created,
+    };
+  }
+
+  private async *streamOrdinaryDirectLlm(
+    context: BuiltContext,
+    modelName: string | undefined,
+    signal: AbortSignal | undefined,
+    usageOut: TokenUsage | undefined,
+    capture: { text: string },
+  ): AsyncGenerator<PersonalAIEvent> {
+    for await (const delta of this.deps.modelAdapter.stream(context.messages, {
+      model: modelName,
+      signal,
+      onUsage: (usage: TokenUsage): void => {
+        if (usageOut) Object.assign(usageOut, usage);
+      },
+    })) {
+      capture.text += delta;
+      yield { type: 'text_delta', content: delta };
+    }
+  }
+
+  private async *runMulticaDelegation(
+    execution: ExecutionTask,
+    created: boolean,
+    identity: PersonalAIIdentity,
+    signal: AbortSignal | undefined,
+    capture: { text: string },
+  ): AsyncGenerator<PersonalAIEvent> {
+    this.deps.conversationStore.touch(identity, execution.id);
+    if (created) yield { type: 'task_started', taskId: execution.id };
+    if (created) await this.deps.worker.dispatch(execution.id);
+
+    let lastStatus = '';
+    let agentAnnounced = false;
+    const deadline: number = Date.now() + this.deps.personalAI.streamMaxMs;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) break;
+      const current = this.deps.taskManager.getForUser(identity.user_id, execution.id);
+      if (!current) break;
+      if (current.status !== lastStatus) {
+        lastStatus = current.status;
+        yield {
+          type: 'task_progress',
+          taskId: execution.id,
+          status: current.status,
+          message: current.progress_message ?? undefined,
+        };
+        if (current.status === 'running' && current.agent_id && !agentAnnounced) {
+          agentAnnounced = true;
+          yield { type: 'agent_started', taskId: execution.id, agentId: current.agent_id };
+        }
+      }
+      if (current.status === 'completed') {
+        if (agentAnnounced) {
+          yield {
+            type: 'agent_completed',
+            taskId: execution.id,
+            agentId: current.agent_id ?? 'unknown',
+          };
+        }
+        capture.text = aggregateAgentResult({
+          taskId: execution.id,
+          agentId: current.agent_id ?? undefined,
+          content: current.result ?? undefined,
+        });
+        yield { type: 'final_answer', content: capture.text };
+        break;
+      }
+      if (current.status === 'failed' || current.status === 'cancelled') {
+        yield {
+          type: 'task_failed',
+          taskId: execution.id,
+          error: current.error ?? '任务失败',
+        };
+        capture.text = aggregateAgentResult({ taskId: execution.id, error: current.error ?? '任务失败' });
+        yield { type: 'final_answer', content: capture.text };
+        break;
+      }
+      await sleep(Math.max(100, this.deps.personalAI.multica.pollIntervalMs));
+    }
+
+    if (capture.text === '') {
+      capture.text = aggregateAgentResult({
+        taskId: execution.id,
+        degraded: true,
+        content: `任务已在后台执行，可通过 GET /v1/personal-ai/tasks/${execution.id} 查询进度与结果。`,
+      });
+      yield { type: 'final_answer', content: capture.text };
+    }
+  }
+
+  private async *runDirectAgentDelegation(
+    businessTask: BusinessTask,
+    execution: ExecutionTask,
+    agent: AgentProfile,
+    identity: PersonalAIIdentity,
+    modelName: string | undefined,
+    signal: AbortSignal | undefined,
+    usageOut: TokenUsage | undefined,
+    capture: { text: string },
+  ): AsyncGenerator<PersonalAIEvent> {
+    this.deps.conversationStore.touch(identity, execution.id);
+    yield { type: 'task_started', taskId: execution.id };
+    yield { type: 'agent_started', taskId: execution.id, agentId: agent.agent_id };
+
+    if (!this.deps.directRunner) {
+      // 无 DirectExecutionRunner 注入时的安全降级
+      const fallbackError = 'DirectExecutionRunner 未配置';
+      yield { type: 'task_failed', taskId: execution.id, error: fallbackError };
+      capture.text = aggregateAgentResult({ taskId: execution.id, error: fallbackError });
+      yield { type: 'final_answer', content: capture.text };
+      return;
+    }
+
+    try {
+      for await (const delta of this.deps.directRunner.stream(businessTask, execution, agent, identity, {
+        signal,
+        modelOverride: modelName,
+        onUsage: (usage: TokenUsage): void => {
+          if (usageOut) Object.assign(usageOut, usage);
+        },
+        rethrowOnError: true,
+      })) {
+        capture.text += delta;
+        yield { type: 'text_delta', content: delta };
+      }
+      yield { type: 'agent_completed', taskId: execution.id, agentId: agent.agent_id };
+    } catch (error) {
+      const message: string = error instanceof Error ? error.message : String(error);
+      yield { type: 'task_failed', taskId: execution.id, error: message };
+      capture.text = aggregateAgentResult({ taskId: execution.id, error: message });
+      yield { type: 'final_answer', content: capture.text };
+    }
+  }
+
+  private async *dispatchPreparedDelegation(
+    prepared: {
+      businessTask: BusinessTask | null;
+      execution: ExecutionTask;
+      agent: AgentProfile | null;
+      created: boolean;
+    },
+    identity: PersonalAIIdentity,
+    modelName: string | undefined,
+    signal: AbortSignal | undefined,
+    usageOut: TokenUsage | undefined,
+    capture: { text: string },
+  ): AsyncGenerator<PersonalAIEvent> {
+    if (prepared.execution.execution_mode === 'direct_llm') {
+      if (prepared.created && prepared.businessTask && prepared.agent) {
+        yield* this.runDirectAgentDelegation(
+          prepared.businessTask,
+          prepared.execution,
+          prepared.agent,
+          identity,
+          modelName,
+          signal,
+          usageOut,
+          capture,
+        );
+        return;
+      }
+
+      if (prepared.execution.status === 'completed') {
+        capture.text = prepared.execution.result ?? '';
+        yield { type: 'final_answer', content: capture.text };
+        return;
+      }
+      if (prepared.execution.status === 'failed' || prepared.execution.status === 'cancelled') {
+        const err: string = prepared.execution.error ?? '任务失败';
+        yield { type: 'task_failed', taskId: prepared.execution.id, error: err };
+        capture.text = aggregateAgentResult({ taskId: prepared.execution.id, error: err });
+        yield { type: 'final_answer', content: capture.text };
+        return;
+      }
+      capture.text = aggregateAgentResult({
+        taskId: prepared.execution.id,
+        degraded: true,
+        content: `任务正在执行中，可通过 GET /v1/personal-ai/tasks/${prepared.execution.id} 查询结果。`,
+      });
+      yield { type: 'final_answer', content: capture.text };
+      return;
+    }
+
+    yield* this.runMulticaDelegation(
+      prepared.execution,
+      prepared.created,
+      identity,
+      signal,
+      capture,
+    );
+  }
+
+  private handleStructuredDomainCreate(
+    intent: StructuredIntent,
+    identity: PersonalAIIdentity,
+    timezone?: string,
+  ): string | null {
+    const userOptions = { headerTimezone: timezone };
+    if (intent.action === 'create_goal' && this.deps.goalStore) {
+      const goal = this.deps.goalStore.create(
+        identity.user_id,
+        {
+          title: intent.title as string,
+          description: intent.description ?? '',
+          priority: intent.priority,
+          target_date: intent.target_date ?? null,
+        },
+        userOptions,
+      );
+      return `[知忆] 已为你创建目标：「${goal.title}」（ID: \`${goal.id}\`，优先级 P${goal.priority}）。`;
+    }
+
+    if (intent.action === 'create_project' && this.deps.projectStore) {
+      const ownedGoalIds: string[] = (intent.goal_ids ?? []).filter(
+        (gid: string): boolean => this.deps.goalStore?.get(identity.user_id, gid) !== undefined,
+      );
+      const project = this.deps.projectStore.create(
+        identity.user_id,
+        {
+          title: intent.title as string,
+          description: intent.description ?? '',
+          goal_ids: ownedGoalIds,
+        },
+        userOptions,
+      );
+      return `[知忆] 已为你创建项目：「${project.title}」（ID: \`${project.id}\`）。`;
+    }
+
+    if (intent.action === 'create_task' && this.deps.businessTaskManager) {
+      const ownedProjectId: string | null =
+        intent.project_id && this.deps.projectStore?.get(identity.user_id, intent.project_id)
+          ? intent.project_id
+          : null;
+      const requestedAgent: AgentProfile | undefined = intent.preferred_agent_id
+        ? this.deps.agentStore.get(intent.preferred_agent_id)
+        : undefined;
+      const activeAgentId: string | null =
+        requestedAgent && requestedAgent.status === 'active' ? requestedAgent.agent_id : null;
+
+      const task = this.deps.businessTaskManager.create(
+        identity.user_id,
+        {
+          title: intent.title as string,
+          description: intent.description ?? '',
+          project_id: ownedProjectId,
+          priority: intent.priority,
+          assignee_agent_id: activeAgentId,
+          status: activeAgentId ? 'assigned' : 'pending',
+        },
+        userOptions,
+      );
+      const assigneeNote: string = task.assignee_agent_id ? `，指派给 ${task.assignee_agent_id}` : '';
+      return `[知忆] 已记录待办任务：「${task.title}」（ID: \`${task.id}\`，状态 ${task.status}${assigneeNote}）。`;
+    }
+
+    return null;
+  }
+
+  async *run(input: RunInput): AsyncGenerator<PersonalAIEvent> {
+    const { identity, messages } = input;
+    const capture = { text: '' };
+    let modelName: string | undefined = input.model;
+    const userPrompt: string = lastUserPrompt(messages);
+    if (userPrompt !== '' && this.deps.upstream) {
+      void this.deps.upstream
+        .reportUsage({
+          sessionId: identity.session_id ?? identity.conversation_id,
+          prompt: userPrompt,
+          cwd: process.cwd(),
+        })
+        .catch((error: unknown): void => {
+          this.deps.logger.warn('[personal-ai] DUCX 来源上报失败（不影响对话）', error);
+        });
+    }
+
+    try {
+      this.deps.userProfiles?.ensureUser(identity.user_id, { headerTimezone: input.timezone });
+      this.deps.conversationStore.touch(identity);
+      yield { type: 'message_start', conversationId: identity.conversation_id };
+
+      // 只要运行时模型配置尚未加载过（首次请求前），预先解析一次，确保 DUCX 模型名可用。
+      if (this.deps.upstream) {
+        const resolved = await this.deps.upstream.resolveForRequest(modelName);
+        if (resolved) modelName = resolved.model;
+      }
+
+      const context = buildPersonalAIContext(
+        {
+          config: this.deps.config,
+          memoryStore: this.deps.memoryStore,
+          agentStore: this.deps.agentStore,
+          userProfiles: this.deps.userProfiles,
+          goalStore: this.deps.goalStore,
+          projectStore: this.deps.projectStore,
+          businessTaskManager: this.deps.businessTaskManager,
+        },
+        identity,
+        messages,
+      );
+
+      const structured: StructuredIntent | null = await this.tryClassifyIntent(
+        context,
+        modelName,
+        input.signal,
+      );
+
+      if (
+        structured &&
+        (structured.action === 'create_goal' ||
+          structured.action === 'create_project' ||
+          structured.action === 'create_task')
+      ) {
+        const confirmation: string | null = this.handleStructuredDomainCreate(
+          structured,
+          identity,
+          input.timezone,
+        );
+        if (confirmation !== null) {
+          this.deps.logger.info(
+            `[personal-ai] intent=${structured.action} reason=${structured.reason}`,
+          );
+          capture.text = confirmation;
+          yield { type: 'text_delta', content: confirmation };
+          return;
+        }
+      }
+
+      if (structured && structured.action === 'direct_llm') {
+        this.deps.logger.info(
+          `[personal-ai] mode=direct_llm reason=${structured.reason} memory=${context.memoryInjected ? 'on' : 'off'}`,
+        );
+        yield* this.streamOrdinaryDirectLlm(context, modelName, input.signal, input.usage, capture);
+        return;
+      }
+
+      if (structured && structured.action === 'delegate_task') {
+        const selected = this.deps.agentSelector?.select({
+          taskText: [structured.title, structured.description, context.taskText]
+            .filter(Boolean)
+            .join('\n'),
+          preferredAgentId: this.resolveExplicitPreferredAgent(
+            identity,
+            structured.preferred_agent_id,
+          ),
+          multicaEnabled: this.deps.personalAI.multica.enabled,
+          defaultAgentId: this.deps.personalAI.multica.defaultAgent || undefined,
+        });
+        const pickedAgent: AgentProfile | null = selected?.agent ?? null;
+
+        if (!pickedAgent && !this.deps.personalAI.multica.enabled) {
+          this.deps.logger.info(
+            '[personal-ai] mode=direct_llm reason=无可用Agent且MULTICA_ENABLED=false，降级直接回答',
+          );
+          yield* this.streamOrdinaryDirectLlm(context, modelName, input.signal, input.usage, capture);
+          return;
+        }
+
+        const ownedProjectId: string | null =
+          structured.project_id && this.deps.projectStore?.get(identity.user_id, structured.project_id)
+            ? structured.project_id
+            : null;
+        const prepared = this.prepareExecutionRecord(
+          identity,
+          structured.title ?? (oneLine(context.taskText, 80) || '知忆任务'),
+          structured.description ?? context.taskText.slice(0, 2000),
+          pickedAgent,
+          ownedProjectId,
+          input.timezone,
+        );
+        this.deps.logger.info(
+          `[personal-ai] mode=${prepared.execution.execution_mode} agent=${prepared.agent?.agent_id ?? 'default'} reason=${selected?.reason ?? structured.reason}`,
+        );
+
+        yield* this.dispatchPreparedDelegation(
+          prepared,
+          identity,
+          modelName,
+          input.signal,
+          input.usage,
+          capture,
+        );
+        return;
+      }
+
+      // V1 规则路由（默认或 LLM 意图不可用/未命中时的安全回退）
+      const intent = understandIntent(context.taskText, this.deps.personalAI.agentKeywords);
+      const plan = planExecution(intent, context, this.deps.personalAI);
+
+      if (plan.mode === 'direct_llm') {
+        this.deps.logger.info(
+          `[personal-ai] mode=direct_llm reason=${plan.reason} memory=${context.memoryInjected ? 'on' : 'off'}`,
+        );
+        yield* this.streamOrdinaryDirectLlm(context, modelName, input.signal, input.usage, capture);
+        return;
+      }
+
+      const selected = this.deps.agentSelector?.select({
+        taskText: context.taskText,
+        preferredAgentId: this.resolveExplicitPreferredAgent(identity),
+        multicaEnabled: this.deps.personalAI.multica.enabled,
+        defaultAgentId: plan.agentId,
+      });
+      const pickedAgent: AgentProfile | null = selected?.agent ?? null;
+      const prepared = this.prepareExecutionRecord(
+        identity,
+        plan.title,
+        plan.description,
+        pickedAgent,
+        null,
+        input.timezone,
+      );
+      this.deps.logger.info(
+        `[personal-ai] mode=${prepared.execution.execution_mode} agent=${prepared.agent?.agent_id ?? 'default'} reason=${selected?.reason ?? plan.reason}`,
+      );
+
+      yield* this.dispatchPreparedDelegation(
+        prepared,
+        identity,
+        modelName,
+        input.signal,
+        input.usage,
+        capture,
+      );
+    } catch (error) {
+      const message: string = error instanceof Error ? error.message : String(error);
+      this.deps.logger.error(`[personal-ai] 执行失败: ${message}`);
+      capture.text = `[错误] ${message}`;
+      yield { type: 'error', message };
+    } finally {
+      this.scheduleTrajectory(identity, messages, capture.text, modelName);
+      yield { type: 'message_end' };
+    }
+  }
+}

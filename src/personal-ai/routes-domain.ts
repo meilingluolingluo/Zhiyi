@@ -1,0 +1,593 @@
+/**
+ * Personal AI V1.5 领域接口路由（Step 4）：
+ * - GET/PATCH /v1/personal-ai/profile
+ * - /v1/personal-ai/goals...
+ * - /v1/personal-ai/projects...
+ * - /v1/personal-ai/work-tasks...（含 /execute、/executions、/cancel）
+ */
+import express, {
+  type Request as ExpressRequest,
+  type Response as ExpressResponse,
+  type Router,
+} from 'express';
+import type { Database } from '../db';
+import { errorBody } from '../errors';
+import type { AgentExecutionAdapter } from './adapters/agent/agent-adapter';
+import type { PersonalAIConfig } from './config';
+import type { GoalStore } from './domain/goal-store';
+import type { ProjectStore } from './domain/project-store';
+import {
+  DomainError,
+  type GoalFilters,
+  type GoalPatch,
+  type GoalStatus,
+  type NewBusinessTaskInput,
+  type NewGoalInput,
+  type NewProjectInput,
+  type ProjectFilters,
+  type ProjectPatch,
+  type ProjectStatus,
+  type BusinessTaskFilters,
+  type BusinessTaskPatch,
+  type BusinessTaskStatus,
+  type UserProfilePatch,
+} from './domain/types';
+import type { UserProfileStore } from './domain/user-profile-store';
+import {
+  resolvePersonalAIIdentity,
+  type HeaderBag,
+  type PersonalAIIdentity,
+} from './identity/identity-manager';
+import type { DirectExecutionRunner } from './runtime/direct-execution-runner';
+import type { BusinessTaskManager } from './task/business-task-manager';
+import type { TaskManager } from './task/task-manager';
+import type { TaskWorker } from './worker/task-worker';
+
+export interface DomainRouterDeps {
+  db: Database;
+  config: PersonalAIConfig;
+  userProfiles: UserProfileStore;
+  goalStore: GoalStore;
+  projectStore: ProjectStore;
+  businessTaskManager: BusinessTaskManager;
+  taskManager: TaskManager;
+  worker: TaskWorker;
+  adapter: AgentExecutionAdapter | null;
+  directRunner: DirectExecutionRunner;
+}
+
+interface RawBodyRequest extends ExpressRequest {
+  rawBody?: string;
+}
+
+function bodyOf(req: ExpressRequest): Record<string, unknown> {
+  return req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+    ? (req.body as Record<string, unknown>)
+    : {};
+}
+
+function isPlainObjectBody(req: ExpressRequest): boolean {
+  return !!req.body && typeof req.body === 'object' && !Array.isArray(req.body);
+}
+
+function headerText(req: ExpressRequest, name: string): string | null {
+  const raw = req.headers[name.toLowerCase()];
+  const text: string | undefined = Array.isArray(raw) ? raw[0] : raw;
+  return typeof text === 'string' && text.trim() !== '' ? text.trim() : null;
+}
+
+function queryString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
+}
+
+function queryInt(value: unknown, fallback: number): number {
+  const raw: string | undefined = queryString(value);
+  if (!raw) return fallback;
+  const parsed: number = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+function identify(
+  req: ExpressRequest,
+  config: PersonalAIConfig,
+): { ok: true; identity: PersonalAIIdentity } | { ok: false; status: number; error: string } {
+  const body: Record<string, unknown> = bodyOf(req);
+  const rawBody: string = (req as RawBodyRequest).rawBody ?? JSON.stringify(body);
+  const result = resolvePersonalAIIdentity(config, req.headers as HeaderBag, body, rawBody);
+  if (!result.ok || !result.identity) {
+    return { ok: false, status: result.status ?? 401, error: result.error ?? '身份解析失败' };
+  }
+  return { ok: true, identity: result.identity };
+}
+
+function requireIdentity(
+  req: ExpressRequest,
+  res: ExpressResponse,
+  config: PersonalAIConfig,
+): PersonalAIIdentity | null {
+  const auth = identify(req, config);
+  if (!auth.ok) {
+    res.status(auth.status).json(errorBody(auth.error, auth.status === 401 ? 'unauthorized' : 'bad_request'));
+    return null;
+  }
+  return auth.identity;
+}
+
+function handleDomainError(res: ExpressResponse, error: unknown): void {
+  if (error instanceof DomainError) {
+    res.status(error.status).json(errorBody(error.message, error.code, error.type));
+    return;
+  }
+  throw error;
+}
+
+interface TaskStatusAggregate {
+  total: number;
+  completed: number;
+  in_progress: number;
+  failed: number;
+  cancelled: number;
+  pending: number;
+}
+
+function aggregateStatusRows(rows: Array<{ status: string; cnt: number }>): TaskStatusAggregate {
+  const stats: TaskStatusAggregate = {
+    total: 0,
+    completed: 0,
+    in_progress: 0,
+    failed: 0,
+    cancelled: 0,
+    pending: 0,
+  };
+  for (const row of rows) {
+    const count: number = Number(row.cnt);
+    stats.total += count;
+    if (row.status === 'completed') stats.completed += count;
+    else if (row.status === 'in_progress') stats.in_progress += count;
+    else if (row.status === 'failed') stats.failed += count;
+    else if (row.status === 'cancelled') stats.cancelled += count;
+    else stats.pending += count;
+  }
+  return stats;
+}
+
+export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
+  const router: Router = express.Router();
+
+  // ===== User Profile =====
+  router.get('/v1/personal-ai/profile', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    try {
+      const profile = deps.userProfiles.ensureUser(identity.user_id, {
+        headerTimezone: headerText(req, 'x-timezone'),
+      });
+      res.json({ profile });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.patch('/v1/personal-ai/profile', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const profile = deps.userProfiles.update(
+        identity.user_id,
+        req.body as UserProfilePatch,
+        { headerTimezone: headerText(req, 'x-timezone') },
+      );
+      res.json({ profile });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  // ===== Goals =====
+  router.post('/v1/personal-ai/goals', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const goal = deps.goalStore.create(
+        identity.user_id,
+        req.body as NewGoalInput,
+        { headerTimezone: headerText(req, 'x-timezone') },
+      );
+      res.status(201).json({ goal });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/goals', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    try {
+      const filters: GoalFilters = {
+        status: queryString(req.query.status) as GoalStatus | undefined,
+        limit: queryInt(req.query.limit, 50),
+        offset: queryInt(req.query.offset, 0),
+      };
+      res.json(deps.goalStore.list(identity.user_id, filters));
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/goals/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const goal = deps.goalStore.get(identity.user_id, req.params.id);
+    if (!goal) {
+      res.status(404).json(errorBody('Goal 不存在或无权访问', 'not_found'));
+      return;
+    }
+    const projects = deps.goalStore.listProjectsForGoal(identity.user_id, goal.id);
+    const statRows = deps.db.all<{ status: string; cnt: number }>(
+      `SELECT t.status, COUNT(DISTINCT t.id) AS cnt
+         FROM tasks t
+         JOIN projects p ON p.id = t.project_id AND p.user_id = t.user_id
+         JOIN goal_projects gp ON gp.project_id = p.id AND gp.user_id = p.user_id
+        WHERE gp.goal_id = ? AND gp.user_id = ? AND p.deleted_at IS NULL AND t.deleted_at IS NULL
+        GROUP BY t.status`,
+      [goal.id, identity.user_id],
+    );
+    res.json({ goal, projects, task_stats: aggregateStatusRows(statRows) });
+  });
+
+  router.patch('/v1/personal-ai/goals/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const goal = deps.goalStore.update(
+        identity.user_id,
+        req.params.id,
+        req.body as GoalPatch,
+      );
+      if (!goal) {
+        res.status(404).json(errorBody('Goal 不存在或无权访问', 'not_found'));
+        return;
+      }
+      res.json({ goal });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.delete('/v1/personal-ai/goals/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const deleted: boolean = deps.goalStore.softDelete(identity.user_id, req.params.id);
+    if (!deleted) {
+      res.status(404).json(errorBody('Goal 不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ deleted: true, id: req.params.id });
+  });
+
+  router.post('/v1/personal-ai/goals/:id/projects', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const body = bodyOf(req);
+    if (typeof body.project_id !== 'string' || body.project_id.trim() === '') {
+      res.status(400).json(errorBody('project_id 不能为空', 'bad_request'));
+      return;
+    }
+    const projectId: string = body.project_id.trim();
+    try {
+      deps.goalStore.linkProject(identity.user_id, req.params.id, projectId);
+      res.json({ linked: true, goal_id: req.params.id, project_id: projectId });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.delete('/v1/personal-ai/goals/:id/projects/:projectId', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const unlinked: boolean = deps.goalStore.unlinkProject(
+      identity.user_id,
+      req.params.id,
+      req.params.projectId,
+    );
+    if (!unlinked) {
+      res.status(404).json(errorBody('Goal 与 Project 关联不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ unlinked: true, goal_id: req.params.id, project_id: req.params.projectId });
+  });
+
+  // ===== Projects =====
+  router.post('/v1/personal-ai/projects', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const project = deps.projectStore.create(
+        identity.user_id,
+        req.body as NewProjectInput,
+        { headerTimezone: headerText(req, 'x-timezone') },
+      );
+      res.status(201).json({ project });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/projects', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    try {
+      const filters: ProjectFilters = {
+        status: queryString(req.query.status) as ProjectStatus | undefined,
+        goal_id: queryString(req.query.goal_id),
+        limit: queryInt(req.query.limit, 50),
+        offset: queryInt(req.query.offset, 0),
+      };
+      res.json(deps.projectStore.list(identity.user_id, filters));
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/projects/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const project = deps.projectStore.get(identity.user_id, req.params.id);
+    if (!project) {
+      res.status(404).json(errorBody('Project 不存在或无权访问', 'not_found'));
+      return;
+    }
+    const goals = deps.projectStore.listGoalsForProject(identity.user_id, project.id);
+    const statRows = deps.db.all<{ status: string; cnt: number }>(
+      `SELECT status, COUNT(*) AS cnt
+         FROM tasks
+        WHERE project_id = ? AND user_id = ? AND deleted_at IS NULL
+        GROUP BY status`,
+      [project.id, identity.user_id],
+    );
+    res.json({ project, goals, task_stats: aggregateStatusRows(statRows) });
+  });
+
+  router.patch('/v1/personal-ai/projects/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const project = deps.projectStore.update(
+        identity.user_id,
+        req.params.id,
+        req.body as ProjectPatch,
+      );
+      if (!project) {
+        res.status(404).json(errorBody('Project 不存在或无权访问', 'not_found'));
+        return;
+      }
+      res.json({ project });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.delete('/v1/personal-ai/projects/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const deleted: boolean = deps.projectStore.softDelete(identity.user_id, req.params.id);
+    if (!deleted) {
+      res.status(404).json(errorBody('Project 不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ deleted: true, id: req.params.id });
+  });
+
+  // ===== Business Tasks (/v1/personal-ai/work-tasks) =====
+  router.post('/v1/personal-ai/work-tasks', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const task = deps.businessTaskManager.create(
+        identity.user_id,
+        req.body as NewBusinessTaskInput,
+        { headerTimezone: headerText(req, 'x-timezone') },
+      );
+      res.status(201).json({ task });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/work-tasks', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    try {
+      const rawParent = req.query.parent_task_id;
+      const parentTaskId: string | null | undefined =
+        rawParent === 'null'
+          ? null
+          : queryString(rawParent);
+      const filters: BusinessTaskFilters = {
+        project_id: queryString(req.query.project_id),
+        status: queryString(req.query.status) as BusinessTaskStatus | undefined,
+        parent_task_id: parentTaskId,
+        limit: queryInt(req.query.limit, 50),
+        offset: queryInt(req.query.offset, 0),
+      };
+      res.json(deps.businessTaskManager.list(identity.user_id, filters));
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/work-tasks/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const detail = deps.businessTaskManager.getDetail(identity.user_id, req.params.id);
+    if (!detail) {
+      res.status(404).json(errorBody('业务任务不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json(detail);
+  });
+
+  router.patch('/v1/personal-ai/work-tasks/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const task = deps.businessTaskManager.update(
+        identity.user_id,
+        req.params.id,
+        req.body as BusinessTaskPatch,
+      );
+      if (!task) {
+        res.status(404).json(errorBody('业务任务不存在或无权访问', 'not_found'));
+        return;
+      }
+      res.json({ task });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.delete('/v1/personal-ai/work-tasks/:id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const cascade: boolean = String(req.query.cascade ?? '').toLowerCase() === 'true';
+    try {
+      const deleted: boolean = deps.businessTaskManager.softDelete(
+        identity.user_id,
+        req.params.id,
+        cascade,
+      );
+      if (!deleted) {
+        res.status(404).json(errorBody('业务任务不存在或无权访问', 'not_found'));
+        return;
+      }
+      res.json({ deleted: true, id: req.params.id });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.post('/v1/personal-ai/work-tasks/:id/execute', async (req, res): Promise<void> => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const body = bodyOf(req);
+    const agentId: string | undefined =
+      typeof body.agent_id === 'string' && body.agent_id.trim() !== ''
+        ? body.agent_id.trim()
+        : undefined;
+
+    try {
+      const prepared = deps.businessTaskManager.prepareExecution(
+        identity.user_id,
+        req.params.id,
+        {
+          agentId,
+          conversationId: identity.conversation_id,
+          multicaEnabled: deps.config.multica.enabled,
+          defaultAgentId: 'developer',
+        },
+      );
+
+      if (prepared.agent.execution_backend === 'direct_llm') {
+        await deps.directRunner.run(
+          prepared.task,
+          prepared.execution,
+          prepared.agent,
+          identity,
+        );
+        const latestTask = deps.businessTaskManager.get(identity.user_id, prepared.task.id);
+        const latestExecution = deps.taskManager.getForUser(
+          identity.user_id,
+          prepared.execution.id,
+        );
+        res.status(200).json({ task: latestTask, execution: latestExecution });
+        return;
+      }
+
+      await deps.worker.dispatch(prepared.execution.id);
+      const latestTask = deps.businessTaskManager.get(identity.user_id, prepared.task.id);
+      const latestExecution = deps.taskManager.getForUser(
+        identity.user_id,
+        prepared.execution.id,
+      );
+      res.status(202).json({ task: latestTask, execution: latestExecution });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/work-tasks/:id/executions', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const limit: number = queryInt(req.query.limit, 50);
+    const offset: number = queryInt(req.query.offset, 0);
+    const page = deps.businessTaskManager.listExecutions(
+      identity.user_id,
+      req.params.id,
+      limit,
+      offset,
+    );
+    if (!page) {
+      res.status(404).json(errorBody('业务任务不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ ...page, limit: Math.min(Math.max(limit, 1), 200), offset });
+  });
+
+  router.post('/v1/personal-ai/work-tasks/:id/cancel', async (req, res): Promise<void> => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    try {
+      const outcome = deps.businessTaskManager.cancelTask(identity.user_id, req.params.id);
+      let externalCancelled = false;
+      for (const exec of outcome.cancelled_executions) {
+        if (exec.execution_mode === 'direct_llm') {
+          if (deps.directRunner.abort(exec.id)) externalCancelled = true;
+        } else if (exec.external_task_id && deps.adapter?.cancelTask) {
+          const ok: boolean = await deps.adapter.cancelTask(
+            exec.external_task_id,
+            exec.external_run_id ?? undefined,
+          );
+          if (ok) externalCancelled = true;
+        }
+      }
+      res.json({
+        ok: true,
+        task: outcome.task,
+        cancelled_executions: outcome.cancelled_executions,
+        external_cancelled: externalCancelled,
+      });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  return router;
+}

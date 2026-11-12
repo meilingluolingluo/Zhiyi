@@ -1,0 +1,153 @@
+# Personal AI Gateway 全栈本地编排
+#
+# 默认启动的 `gateway` 是 MVP 基线（与原 README 一致，端口 8787）。
+# 新增两个服务：
+#   personal-ai-gateway —— 复用本仓库 Dockerfile，开启 Personal AI 层（宿主机 8788）
+#   adp-chat-client    —— 从同级仓库 ../adp-chat-client 构建的对话前端（宿主机 8000）
+#
+# ⚠️ 本机没有 Docker，以下配置**未在容器内实测**（见 README「未验证项」）。
+#    首次使用请按顺序：docker compose build && docker compose up
+#
+# MultiCA（CLI + daemon）运行在**宿主机**，不在容器内：
+#   镜像里既没有 multica 可执行文件，也无法 spawn 宿主机进程，
+#   因此 personal-ai-gateway 默认 MULTICA_ENABLED=false（直连模型可用，Agent 委派降级）。
+#   需要在容器里验证委派链路时，见下方 personal-ai-gateway 的被注释挂载示例。
+
+services:
+  gateway:
+    build: .
+    container_name: universal-memory-gateway
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      DATABASE_URL: /app/data/memory.db
+      MOCK_UPSTREAM: "true"
+      MULTICA_BASE_URL: ""
+      MULTICA_API_KEY: ""
+      DEFAULT_MODEL: mock-gpt
+      MEMORY_ENABLED: "true"
+      MEMORY_AUTO_EXTRACT: "true"
+      MEMORY_MAX_ITEMS: "5"
+      MEMORY_TOKEN_BUDGET: "800"
+      UPSTREAM_TIMEOUT_MS: "30000"
+      # 真实联调时把上面 MOCK_UPSTREAM 改为 false 并填写：
+      # MULTICA_BASE_URL: https://your-multica-endpoint
+      # MULTICA_API_KEY: ${MULTICA_API_KEY}
+      # DEFAULT_MODEL: your-model-name
+    volumes:
+      - memory-data:/app/data
+    restart: unless-stopped
+
+  personal-ai-gateway:
+    build: .
+    container_name: personal-ai-gateway
+    ports:
+      - "8788:8787"
+    depends_on:
+      - adp-chat-client
+    environment:
+      # ===== 基础层（src/config.ts 的 16 个变量）=====
+      PORT: "8787"
+      DATABASE_URL: /app/data/memory.db
+      MOCK_UPSTREAM: "true"
+      MULTICA_BASE_URL: ""
+      MULTICA_API_KEY: ""
+      DEFAULT_MODEL: mock-gpt
+      MEMORY_ENABLED: "true"
+      MEMORY_AUTO_EXTRACT: "true"
+      MEMORY_MAX_ITEMS: "5"
+      MEMORY_TOKEN_BUDGET: "800"
+      EXTRACT_MIN_CONFIDENCE: "0.6"
+      UPSTREAM_TIMEOUT_MS: "30000"
+      # ===== Personal AI 层（src/personal-ai/config.ts）=====
+      PERSONAL_AI_ENABLED: "true"
+      # openai = ADP OpenAICompatible vendor 的真实链路；adp-v2 = 直连 V2 SSE
+      PERSONAL_AI_PROTOCOL: openai
+      # 生产/公网部署务必设置，设置后强制校验 HMAC 签名
+      PERSONAL_AI_SHARED_SECRET: ""
+      PERSONAL_AI_STREAM_MAX_MS: "120000"
+      # ADP 容器健康检查地址（容器内用服务名，不能用 localhost）
+      PERSONAL_AI_ADP_HEALTH_URL: http://adp-chat-client:8000/system/config
+      # ===== MultiCA CLI（宿主侧 Agent 执行平台）=====
+      # 容器内默认关闭：镜像里没有 multica 可执行文件
+      MULTICA_ENABLED: "false"
+      MULTICA_CLI_PATH: /usr/local/bin/multica
+      MULTICA_CLI_CWD: /workspace
+      MULTICA_DAEMON_REQUIRED: "true"
+      MULTICA_POLL_INTERVAL_MS: "3000"
+      MULTICA_COMMAND_TIMEOUT_MS: "30000"
+      MULTICA_MAX_CONCURRENT_TASKS: "3"
+      MULTICA_MAX_POLLS: "200"
+      MULTICA_DEFAULT_AGENT: ""
+    # 让容器能解析宿主机地址（Linux 需要 host-gateway；Docker Desktop 自带）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - personal-ai-data:/app/data
+      # 可选：把宿主机 MultiCA CLI 挂进容器（仅当宿主与镜像 ABI 兼容时可用，
+      #       且 multica 的配置文件目录也需挂载，daemon 地址改为 host.docker.internal）。
+      # - /usr/local/bin/multica:/usr/local/bin/multica:ro
+      # - ${HOME}/.multica:/root/.multica
+      # - ${HOME}/your-code-repo:/workspace
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/health/personal-ai').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  adp-chat-client:
+    # 独立仓库构建：其 Dockerfile 内执行 `COPY docker/server .`，
+    # 因此 build context 必须是该仓库根目录，dockerfile 指向 docker/Dockerfile。
+    build:
+      context: ../adp-chat-client
+      dockerfile: docker/Dockerfile
+    container_name: adp-chat-client
+    ports:
+      - "8000:8000"
+    environment:
+      # 一个「应用」= 一个对话入口；Vendor=OpenAICompatible 表示后端是标准 OpenAI 协议。
+      # BaseUrl 指向本 Gateway 的 /v1/personal-ai 前缀：
+      # ADP 会自行拼接 /chat/completions，且因为它已包含 "/v1/" 而不会再加一层 /v1。
+      APP_CONFIGS: >-
+        [
+          {
+            "Vendor": "OpenAICompatible",
+            "ApplicationId": "personal-ai-gateway",
+            "Comment": "知忆（Zhiyi）· Personal AI Gateway（本仓库）",
+            "DisplayName": "知忆",
+            "Avatar": "http://127.0.0.1:8000/static/brand/zhiyi-256.png",
+            "Greeting": "你好，我是知忆（Zhiyi）。我记得你的偏好与项目，也能在需要时委派专业 Agent 替你完成任务。",
+            "BaseUrl": "http://personal-ai-gateway:8787/v1/personal-ai",
+            "ApiKey": "dev-key-developer",
+            "ModelName": "mock-gpt",
+            "Temperature": 0.7,
+            "MaxTokens": 2000
+          }
+        ]
+      # 会话签名密钥必须显式提供（可用 uuidgen 生成）
+      SECRET_KEY: "${ADP_SECRET_KEY:-change-me-please-use-uuidgen}"
+      LOG_LEVEL: INFO
+      SERVICE_API_URL: ""
+    healthcheck:
+      # /system/config 来自 server/router/system.py:24（源码可查），返回 JSON 配置
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/system/config', timeout=3)"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  memory-data:
+  personal-ai-data:
