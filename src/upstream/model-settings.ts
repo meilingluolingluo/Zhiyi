@@ -59,34 +59,34 @@ export const DEFAULT_DUCX_EXECUTABLE: string = path.join(
 /** codex-mixin 的 Baidu OneAPI 模型发现端点：比 /v1/models 多出 auto 等特殊模型与能力元数据。 */
 export const BAIDU_AVAILABLE_MODELS_PATH = '/openapi/v2/available_models';
 
-/** 与 codex-mixin 的 baidu-oneapi 预设保持一致：DUCX 登录态 + OpenAI 兼容端点。 */
+/** 常用上游预设：以通用中转与本机代理为主，兼容 Baidu OneAPI 登录态。 */
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   {
-    id: 'local-proxy',
-    label: '本机 codex-mix 代理',
-    baseUrl: 'http://127.0.0.1:8787/v1',
-    authMode: 'api_key',
-    modelsPath: '/models',
-    modelsSource: 'single',
-    description: '沿用已运行的 8787 代理（DUCX 认证由代理侧完成）',
-  },
-  {
-    id: 'baidu-oneapi-ducx',
-    label: 'Baidu OneAPI · DUCX 登录态',
-    baseUrl: 'https://oneapi-comate.baidu-int.com/v1',
-    authMode: 'ducx',
-    modelsPath: '/models',
-    modelsSource: 'auto',
-    description: '直连百度 OneAPI，合并两个模型端点拿到完整列表，DUCX 登录态由知忆托管',
-  },
-  {
     id: 'custom',
-    label: '自定义 OpenAI 兼容端点',
+    label: '通用 OpenAI 兼容接口',
     baseUrl: '',
     authMode: 'api_key',
     modelsPath: '/models',
     modelsSource: 'auto',
-    description: '任意支持 /v1/chat/completions 与 /v1/models 的服务',
+    description: '适配 OpenAI、DeepSeek、OpenRouter 及任意标准中转 API',
+  },
+  {
+    id: 'local-proxy',
+    label: '本机代理服务',
+    baseUrl: 'http://127.0.0.1:8787/v1',
+    authMode: 'api_key',
+    modelsPath: '/models',
+    modelsSource: 'single',
+    description: '连接本机已运行的中转代理端口',
+  },
+  {
+    id: 'baidu-oneapi-ducx',
+    label: 'Baidu OneAPI',
+    baseUrl: 'https://oneapi-comate.baidu-int.com/v1',
+    authMode: 'ducx',
+    modelsPath: '/models',
+    modelsSource: 'auto',
+    description: '使用本机登录态直连，免填 API Key',
   },
 ];
 
