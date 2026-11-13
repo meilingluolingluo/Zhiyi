@@ -857,12 +857,22 @@ export class PersonalAIRuntime {
         return;
       }
 
-      // 显式通过服务端 API Key 指定了 OpenClaw Agent 且用户未点名转派其他 Agent 时，直接进入该 OpenClaw 执行分支；已禁用则拒绝。
+      // 显式指定了 OpenClaw Agent 且有明确操作意图时，进入 OpenClaw 工具调用分支；
+      // 纯想法探讨与可行性咨询直接调用模型直接生成建议，不落库委派任务；
+      // 任务负责人指派（如“把某任务交给某 Agent”）仍由 OpenClaw 工具网关执行 task_update。
       const explicitAgentId: string | undefined = this.resolveExplicitPreferredAgent(identity);
+      const isTaskAssignmentOnly: boolean =
+        /(?:把|将).+?(?:交给|指派给|分配给|委托给|派给)/.test(currentTurnPrompt) &&
+        !/(?:开始|执行|启动|跑|运行)/.test(currentTurnPrompt);
+      const isIdeaDiscussion: boolean =
+        !isTaskAssignmentOnly &&
+        /(?:是否值得|你怎么看|可行吗|有什么建议|好不好|值得做吗|要不要)/.test(currentTurnPrompt) &&
+        /(?:考虑|想要|打算|想法|方向)/.test(currentTurnPrompt);
       const explicitOpenClawAgent: AgentProfile | undefined =
         explicitAgentId &&
         !isGreetingOnly(currentTurnPrompt) &&
-        (!userRequestedAgentId || userRequestedAgentId === explicitAgentId)
+        !isIdeaDiscussion &&
+        (!userRequestedAgentId || userRequestedAgentId === explicitAgentId || isTaskAssignmentOnly)
           ? this.deps.agentStore.get(explicitAgentId)
           : undefined;
       if (

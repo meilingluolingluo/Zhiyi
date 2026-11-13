@@ -76,9 +76,19 @@ export function resolveOneApiRoute(
   if (protocolOverride !== 'auto') {
     protocol = protocolOverride;
   } else if (isBaidu) {
-    protocol = upstreamModel.toLowerCase().startsWith('gpt-')
-      ? 'openai_responses'
-      : 'anthropic_messages';
+    const lower = upstreamModel.toLowerCase();
+    if (lower.startsWith('gpt-')) {
+      protocol = 'openai_responses';
+    } else if (
+      lower.startsWith('ernie-') ||
+      lower.startsWith('deepseek-') ||
+      lower.startsWith('glm-') ||
+      lower.startsWith('qwen-')
+    ) {
+      protocol = 'openai_chat';
+    } else {
+      protocol = 'anthropic_messages';
+    }
   } else {
     protocol = 'openai_chat';
   }
