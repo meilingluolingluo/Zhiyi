@@ -24,10 +24,10 @@ import type { TaskRepository } from './task-repository';
 export const MAX_TASK_DEPTH = 10;
 
 const MANUAL_PATCH_TRANSITIONS: Readonly<Record<BusinessTaskStatus, readonly BusinessTaskStatus[]>> = {
-  draft: ['draft', 'pending', 'ready', 'assigned'],
-  pending: ['pending', 'ready', 'assigned'],
-  ready: ['pending', 'ready', 'assigned'],
-  assigned: ['pending', 'ready', 'assigned'],
+  draft: ['draft', 'pending', 'ready', 'assigned', 'blocked'],
+  pending: ['pending', 'ready', 'assigned', 'blocked'],
+  ready: ['pending', 'ready', 'assigned', 'blocked'],
+  assigned: ['pending', 'ready', 'assigned', 'blocked'],
   in_progress: [],
   blocked: ['pending', 'ready', 'assigned', 'blocked'],
   completed: [],

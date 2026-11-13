@@ -22,7 +22,7 @@ const CAPTURABLE_HEADERS: readonly string[] = [
   'x-auth-client-token',
 ];
 const HEADER_TTL_MS = 60_000;
-const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_TIMEOUT_MS = 45_000;
 const DUCX_PLATFORM = 'AIIDE-terminal';
 
 export interface DucxOptions {

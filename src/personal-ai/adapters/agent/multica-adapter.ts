@@ -212,6 +212,7 @@ export class MulticaAdapter implements AgentExecutionAdapter {
       'issue', 'create',
       '--title', title,
       '--description', description,
+      '--allow-duplicate',
     ];
     if (input.agentId) args.push('--assignee', checkAgent(input.agentId));
     const parsed: unknown = await this.json(args);
