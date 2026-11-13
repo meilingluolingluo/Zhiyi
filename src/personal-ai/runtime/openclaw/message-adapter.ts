@@ -192,3 +192,56 @@ export function compactAgentMessagesIfNeeded(
 export function extractToolCalls(message: AssistantMessage): ToolCall[] {
   return message.content.filter((block): block is ToolCall => block.type === 'toolCall');
 }
+
+function chatContentToPlainText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string') {
+        return (part as { text: string }).text;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** 将多轮历史对话中的 user/assistant 轮次转换为 OpenClaw 初始消息列表。 */
+export function chatHistoryToAgentMessages(
+  history: readonly ChatMessage[] | undefined,
+  modelId: string,
+): AgentMessage[] {
+  if (!history || history.length === 0) return [];
+  const result: AgentMessage[] = [];
+  const baseTs = Date.now() - history.length * 1000;
+
+  history.forEach((msg, index) => {
+    const text = chatContentToPlainText(msg.content).trim();
+    if (text === '') return;
+    const timestamp = baseTs + index * 1000;
+    if (msg.role === 'user') {
+      result.push({ role: 'user', content: text, timestamp });
+    } else if (msg.role === 'assistant') {
+      result.push({
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        api: 'openai-completions',
+        provider: 'zhiyi-model-adapter',
+        model: modelId,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'stop',
+        timestamp,
+      });
+    }
+  });
+  return result;
+}

@@ -15,10 +15,56 @@ import type { Agent } from '../../vendor/openclaw/agent-core/agent.js';
 import { createZhiyiOpenClawAgent } from './agent-factory';
 import { createOpenClawEventTranslator } from './event-adapter';
 import {
+  chatHistoryToAgentMessages,
   extractTextFromAssistantMessage,
   findLastAssistantMessage,
 } from './message-adapter';
+import { resolveAgentAllowedTools } from './tool-gateway';
 import type { OpenClawAgentRunnerDeps, OpenClawRunOptions } from './types';
+
+const WORK_TOOL_NAMES: readonly string[] = [
+  'goal_list',
+  'goal_create',
+  'goal_update',
+  'project_list',
+  'project_create',
+  'project_update',
+  'project_summary',
+  'proactive_notifications',
+  'task_list',
+  'task_detail',
+  'task_executions',
+  'task_create',
+  'task_update',
+];
+
+const MEMORY_TOOL_NAMES: readonly string[] = [
+  'memory_search',
+  'memory_get',
+  'memory_create',
+  'memory_update',
+  'memory_archive',
+];
+
+const MEMORY_TOOL_GUIDANCE: string = [
+  '[长期记忆使用准则]',
+  '1. 只保存具有长期价值的用户偏好、稳定个人属性、长期目标、项目关键决策与已验证经验；闲聊或一次性临时安排禁止写入。',
+  '2. 严禁把任务或项目的易变状态（pending/in_progress 等）复制到记忆中；任务状态应始终通过工作管理工具查询。',
+  '3. 保护用户已确认记忆：严禁凭模型推测直接覆盖或归档用户已确认信息；仅当用户明确要求纠正或作废时，才调用 memory_update / memory_archive 并设置 user_confirmed_correction=true。',
+  '4. 写入前可先检索查重，并尽量关联对应的 goal_id / project_id / task_id 以便后续工作上下文精准召回。',
+  '[/长期记忆使用准则]',
+].join('\n');
+
+const WORK_TOOL_GUIDANCE: string = [
+  '[工作管理工具使用准则]',
+  '1. 查询优先于猜测：查看未完成事项或找不到确切 ID 时，先调用 project_list / task_list / goal_list / task_detail 核实真实数据；严禁编造或猜想 ID。',
+  '2. 讨论想法不要擅自建单：若用户只是在探讨思路、征求意见或闲聊，直接回复讨论即可，禁止私自调用 task_create / project_create / goal_create。',
+  '3. 明确要求再创建/修改：仅当用户明确要求记录、新建或更新目标/项目/任务时，才调用对应创建或修改工具；创建任务默认只落库追踪，不会自动触发执行。',
+  '4. 缺关键信息先确认：当操作对象不明确（如存在多个同名项目/任务）或缺少必要字段时，先向用户简明确认，不要代作决定。',
+  '5. 严守操作边界：删除、取消或启动执行任务均不在工作管理工具权限范围内；如用户明确需要取消或执行任务，请引导通过对应的执行或取消接口完成。',
+  '6. 如实反馈结果：仅依据工具真实返回的数据（ID、标题、状态、优先级、关联项目）作答，不虚构未执行的变更。',
+  '[/工作管理工具使用准则]',
+].join('\n');
 
 const MAX_RESULT_CHARS = 100_000;
 
@@ -81,6 +127,13 @@ export class OpenClawAgentRunner {
     if (prebuiltSystemMessage && prebuiltSystemMessage.trim() !== '') {
       parts.push(prebuiltSystemMessage.trim());
     }
+    const allowed = resolveAgentAllowedTools({ agent });
+    if (WORK_TOOL_NAMES.some((name) => allowed.has(name))) {
+      parts.push(WORK_TOOL_GUIDANCE);
+    }
+    if (MEMORY_TOOL_NAMES.some((name) => allowed.has(name))) {
+      parts.push(MEMORY_TOOL_GUIDANCE);
+    }
     if (agent.instructions.trim() !== '') {
       parts.push(`[Agent 角色指令]\n${agent.instructions.trim()}`);
     }
@@ -103,6 +156,7 @@ export class OpenClawAgentRunner {
       options.modelOverride ||
       this.deps.config.defaultModel;
     const systemPrompt = this.buildSystemPrompt(agentProfile, options.prebuiltSystemMessage);
+    const initialMessages = chatHistoryToAgentMessages(options.historyMessages, modelName);
 
     const agent = createZhiyiOpenClawAgent({
       modelName,
@@ -118,6 +172,7 @@ export class OpenClawAgentRunner {
       maxContextTokens: options.maxContextTokens,
       getTurnCount: () => currentTurns,
       publicOrigin: options.publicOrigin,
+      initialMessages,
     });
 
     this.activeRuns.set(execution.id, { agent, controller });
@@ -141,10 +196,40 @@ export class OpenClawAgentRunner {
     const unsubscribe = agent.subscribe((event) => {
       handleEvent(event);
       currentTurns = metrics.turns;
+      if (event.type === 'tool_execution_start') {
+        this.deps.businessTaskManager.recordExecutionProgress(
+          execution.id,
+          `调用工具：${event.toolName}`,
+          {
+            eventType: 'tool_call',
+            metadata: { phase: 'start', tool: event.toolName, tool_call_id: event.toolCallId },
+          },
+        );
+      } else if (event.type === 'tool_execution_end') {
+        this.deps.businessTaskManager.recordExecutionProgress(
+          execution.id,
+          `工具结束：${event.toolName}${event.isError ? '（失败）' : ''}`,
+          {
+            eventType: 'tool_call',
+            metadata: {
+              phase: 'end',
+              tool: event.toolName,
+              tool_call_id: event.toolCallId,
+              is_error: event.isError,
+            },
+          },
+        );
+      }
     });
 
+    const desc = task.description.trim();
+    const title = task.title.trim();
     const userPrompt: string =
-      [task.title, task.description].filter(Boolean).join('\n\n') || task.title;
+      desc !== '' && desc !== title
+        ? desc.includes(title)
+          ? desc
+          : `${title}\n\n${desc}`
+        : title;
 
     const promptPromise: Promise<unknown> = agent
       .prompt(userPrompt)
@@ -189,9 +274,12 @@ export class OpenClawAgentRunner {
         this.deps.logger.warn(
           `[openclaw-runner] 执行 ${execution.id} 失败: ${failureMessage}`,
         );
+        const statusMatch = failureMessage.match(/模型上游返回\s+(\d{3})/);
+        const statusCode = statusMatch ? Number(statusMatch[1]) : undefined;
         this.deps.businessTaskManager.finishDirectExecution(execution.id, {
           status: 'failed',
           error: failureMessage,
+          statusCode,
         });
         if (options.rethrowOnError) {
           throw new Error(failureMessage);

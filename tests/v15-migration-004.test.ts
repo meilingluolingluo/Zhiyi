@@ -49,12 +49,14 @@ describe('Migration 004 (V1.5 Phase 1)', () => {
     const versions = db
       .all<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version ASC')
       .map((r) => r.version);
-    expect(versions).toEqual([
-      '001_init',
-      '002_trajectory_request_scope',
-      '003_personal_ai',
-      '004_v1_5_phase1',
-    ]);
+    expect(versions).toEqual(
+      expect.arrayContaining([
+        '001_init',
+        '002_trajectory_request_scope',
+        '003_personal_ai',
+        '004_v1_5_phase1',
+      ]),
+    );
 
     const tables = db
       .all<{ name: string }>(
@@ -302,6 +304,35 @@ describe('Migration 004 (V1.5 Phase 1)', () => {
 
     db.exec(`
       BEGIN TRANSACTION;
+      DROP INDEX IF EXISTS idx_proactive_notifications_user_status;
+      DROP INDEX IF EXISTS idx_proactive_notifications_user_entity;
+      DROP TABLE IF EXISTS proactive_notifications;
+      DROP TABLE IF EXISTS proactive_schedule_state;
+      DELETE FROM schema_migrations WHERE version = '007_proactive_assistant';
+      DROP INDEX IF EXISTS idx_memories_user_status;
+      ALTER TABLE memories DROP COLUMN status;
+      ALTER TABLE memories DROP COLUMN category;
+      ALTER TABLE memories DROP COLUMN verified_by_user;
+      ALTER TABLE memories DROP COLUMN goal_id;
+      ALTER TABLE memories DROP COLUMN task_id;
+      ALTER TABLE memories DROP COLUMN expires_at;
+      ALTER TABLE memories DROP COLUMN superseded_by;
+      ALTER TABLE memories DROP COLUMN archived_at;
+      ALTER TABLE memory_candidates DROP COLUMN category;
+      ALTER TABLE memory_candidates DROP COLUMN goal_id;
+      ALTER TABLE memory_candidates DROP COLUMN task_id;
+      ALTER TABLE memory_candidates DROP COLUMN conflict_memory_id;
+      DELETE FROM schema_migrations WHERE version = '006_memory_evolution';
+      DROP INDEX IF EXISTS idx_execution_events_execution;
+      DROP INDEX IF EXISTS idx_execution_events_task;
+      DROP TABLE IF EXISTS execution_events;
+      ALTER TABLE execution_tasks DROP COLUMN error_category;
+      ALTER TABLE execution_tasks DROP COLUMN error_code;
+      ALTER TABLE execution_tasks DROP COLUMN retryable;
+      ALTER TABLE execution_tasks DROP COLUMN needs_verification;
+      ALTER TABLE execution_tasks DROP COLUMN retry_of_execution_id;
+      ALTER TABLE execution_tasks DROP COLUMN last_progress_at;
+      DELETE FROM schema_migrations WHERE version = '005_execution_lifecycle';
       DROP TRIGGER IF EXISTS trg_execution_tasks_task_owner_insert;
       DROP TRIGGER IF EXISTS trg_execution_tasks_task_owner_update;
       DROP INDEX IF EXISTS idx_execution_tasks_one_active_per_task;

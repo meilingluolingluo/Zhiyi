@@ -1,14 +1,28 @@
-/** 任务门面：对外只暴露受用户隔离约束的操作。 */
-import type { ExecutionTask, NewExecutionTask, TaskRepository, TaskPatch } from './task-repository';
+/** 任务门面：对外只暴露受用户隔离约束的操作，并同步记录取消等生命周期事件。 */
+import type { ExecutionEventRecord, ExecutionEventStore } from './execution-event-store';
+import type { ExecutionTask, NewExecutionTask, TaskPatch, TaskRepository } from './task-repository';
 
 export class TaskManager {
   constructor(
     private readonly repo: TaskRepository,
     private readonly onExecutionCancelledInTx?: (taskId: string) => void,
+    private readonly eventStore?: ExecutionEventStore,
   ) {}
 
   createIfAbsent(input: NewExecutionTask): { task: ExecutionTask; created: boolean } {
-    return this.repo.create(input);
+    const res = this.repo.create(input);
+    if (res.created && this.eventStore) {
+      this.eventStore.record({
+        executionId: res.task.id,
+        taskId: res.task.task_id,
+        userId: res.task.user_id,
+        eventType: 'created',
+        agentId: res.task.agent_id,
+        status: res.task.status,
+        message: `创建执行记录（${res.task.execution_mode}）`,
+      });
+    }
+    return res;
   }
 
   getForUser(userId: string, id: string): ExecutionTask | undefined {
@@ -32,12 +46,20 @@ export class TaskManager {
     return this.repo.getLatestByTaskId(userId, taskId);
   }
 
+  listEvents(
+    userId: string,
+    executionId: string,
+    limit?: number,
+    offset?: number,
+  ): { items: ExecutionEventRecord[]; total: number } | undefined {
+    const exec = this.repo.get(userId, executionId);
+    if (!exec || !this.eventStore) return exec ? { items: [], total: 0 } : undefined;
+    return this.eventStore.listByExecution(userId, executionId, limit, offset);
+  }
+
   /**
    * 只允许取消尚未完成的任务；已完成的任务保持原状态。
-   *
-   * 状态流转用 `updateIfActive` 的单条条件 UPDATE 完成（`WHERE status IN (活动态)`），
-   * 因此并发/重复取消时只有一次能成功，其余返回 `already_<终态>`（路由层映射为 409），
-   * 也不会把已经 cancelled 的任务再写一遍造成语义歧义。
+   * 状态流转由单条条件 UPDATE 完成，并发/重复取消时只有一次能成功。
    */
   cancelForUser(userId: string, id: string): { ok: boolean; task?: ExecutionTask; reason?: string } {
     return this.repo.runInTransaction((): { ok: boolean; task?: ExecutionTask; reason?: string } => {
@@ -49,13 +71,25 @@ export class TaskManager {
       const patch: TaskPatch = {
         status: 'cancelled',
         error: '用户取消任务',
+        error_category: 'cancelled',
+        error_code: 'cancelled_by_user',
+        retryable: false,
+        needs_verification: false,
         completed_at: new Date().toISOString(),
       };
       if (!this.repo.updateIfActive(id, patch)) {
-        // 走到这里说明状态在读取后被别处推进到终态（例如 Worker 恰好判定 completed）。
         const latest: ExecutionTask | undefined = this.repo.get(userId, id);
         return { ok: false, reason: `already_${latest?.status ?? 'terminal'}` };
       }
+      this.eventStore?.record({
+        executionId: id,
+        taskId: task.task_id,
+        userId,
+        eventType: 'cancelled',
+        agentId: task.agent_id,
+        status: 'cancelled',
+        message: '用户取消任务',
+      });
       if (task.task_id) {
         this.onExecutionCancelledInTx?.(task.task_id);
       }
@@ -64,12 +98,7 @@ export class TaskManager {
   }
 
   /**
-   * 内部更新入口（门面层）。
-   *
-   * 默认走终态保护更新：已完成 / 失败 / 已取消的任务不会被改回活动态，
-   * 避免调用方无意中「复活」终态任务。
-   *
-   * @returns true = 已写入；false = 任务已是终态或不存在。
+   * 内部更新入口（门面层）：仅在任务处于活动态时更新。
    */
   update(id: string, patch: TaskPatch): boolean {
     return this.repo.updateIfActive(id, patch);

@@ -57,6 +57,41 @@ export const INITIAL_TASK_STATUSES: readonly BusinessTaskStatus[] = [
   'assigned',
 ];
 
+export type ProactiveFrequency = 'minimal' | 'daily' | 'balanced';
+export const PROACTIVE_FREQUENCIES: readonly ProactiveFrequency[] = [
+  'minimal',
+  'daily',
+  'balanced',
+];
+
+export type ProactiveNotificationKind =
+  | 'task_overdue'
+  | 'task_due_soon'
+  | 'task_stalled'
+  | 'execution_failed'
+  | 'task_verification'
+  | 'task_completed_summary'
+  | 'project_progress'
+  | 'goal_stalled'
+  | 'decision_needed';
+
+export const PROACTIVE_NOTIFICATION_KINDS: readonly ProactiveNotificationKind[] = [
+  'task_overdue',
+  'task_due_soon',
+  'task_stalled',
+  'execution_failed',
+  'task_verification',
+  'task_completed_summary',
+  'project_progress',
+  'goal_stalled',
+  'decision_needed',
+];
+
+export interface QuietHoursWindow {
+  start: string;
+  end: string;
+}
+
 export interface UserWorkStyle {
   response_style?: ResponseStyle;
   language?: string;
@@ -66,6 +101,11 @@ export interface UserWorkStyle {
 export interface UserPreferences {
   default_project_id?: string | null;
   memory_injection_enabled?: boolean;
+  proactive_enabled?: boolean;
+  proactive_frequency?: ProactiveFrequency;
+  proactive_types?: ProactiveNotificationKind[];
+  proactive_quiet_hours?: QuietHoursWindow | null;
+  proactive_paused_until?: string | null;
 }
 
 export interface UserProfile {

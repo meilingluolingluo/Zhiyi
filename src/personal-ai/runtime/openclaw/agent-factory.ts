@@ -8,6 +8,7 @@ import type { ModelAdapter, TokenUsage } from '../../adapters/model/model-adapte
 import { Agent } from '../../vendor/openclaw/agent-core/agent.js';
 import type { Model } from '../../vendor/openclaw/llm-core/types.js';
 import { compactAgentMessagesIfNeeded } from './message-adapter';
+import type { AgentMessage } from '../../vendor/openclaw/agent-core/types.js';
 import { createZhiyiStreamFn } from './model-stream-adapter';
 import { createOpenClawToolBindings } from './tool-adapter';
 import type { ZhiyiToolGateway } from './tool-gateway';
@@ -31,6 +32,7 @@ export interface CreateOpenClawAgentParams {
   maxContextTokens?: number;
   getTurnCount: () => number;
   publicOrigin?: string;
+  initialMessages?: AgentMessage[];
 }
 
 export function buildZhiyiModelDescriptor(modelName: string): Model {
@@ -91,6 +93,9 @@ export function createZhiyiOpenClawAgent(params: CreateOpenClawAgentParams): Age
       model: buildZhiyiModelDescriptor(params.modelName),
       thinkingLevel: 'off',
       tools: toolBindings.tools,
+      ...(params.initialMessages && params.initialMessages.length > 0
+        ? { messages: params.initialMessages }
+        : {}),
     },
     streamFn,
     toolExecution,

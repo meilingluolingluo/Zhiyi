@@ -1,7 +1,9 @@
 /**
- * 轻量意图识别：规则驱动、可解释、可追踪。
- * V1 不做自主多 Agent 编排，也不调用模型做「要不要调 Agent」的二次推理。
+ * 轻量意图识别：区分普通问答、讨论想法与需要委派 Agent 执行的明确工作请求。
  */
+import type { AgentProfile } from '../../types';
+import { resolveRequestedAgentReference } from './agent-selector';
+
 export type ExecutionMode = 'direct_llm' | 'agent_delegation';
 
 export interface IntentResult {
@@ -9,6 +11,8 @@ export interface IntentResult {
   reason: string;
   confidence: number;
   matched: string[];
+  /** 若用户在自然语言中明确指定了目标 Agent，记录其标识供调度校验。 */
+  requestedAgentId?: string;
 }
 
 const GREETING_ONLY: RegExp = /^(你好|hi|hello|hey|在吗|谢谢|thanks|再见)[\s!！。,.~]*$/i;
@@ -143,10 +147,40 @@ export function parseStructuredIntent(raw: string, minConfidence = 0.6): Structu
   return result;
 }
 
-export function understandIntent(text: string, keywords: readonly string[]): IntentResult {
+const EXECUTION_WORK_PATTERNS: ReadonlyArray<{ label: string; pattern: RegExp }> = [
+  {
+    label: '深度研究/调研',
+    pattern: /(?:帮我|帮忙|请|麻烦)?(?:研究一下|调研一下|做(?:一次|个).*?调研|深入研究|调研主流|研究.*?主流)/i,
+  },
+  {
+    label: '项目分析与改进整理',
+    pattern: /(?:帮我|帮忙|请|麻烦)?(?:分析|评估|梳理|盘点)(?:一下)?(?:这个|当前|整个|本)?(?:项目|系统|工程|服务|方案).*?(?:改进建议|优化建议|问题|报告|清单|方案)/i,
+  },
+  {
+    label: '明确委派执行',
+    pattern: /(?:交给|指派给|委托给|派给|让).{1,30}(?:agent|智能体|处理|执行|调研|开发|实现|排查)/i,
+  },
+];
+
+export function understandIntent(
+  text: string,
+  keywords: readonly string[],
+  registeredAgents: readonly AgentProfile[] = [],
+): IntentResult {
   const normalized: string = (text ?? '').toLowerCase();
   if (isGreetingOnly(text)) {
     return { mode: 'direct_llm', reason: '普通问候/寒暄，无需外部 Agent', confidence: 0.95, matched: [] };
+  }
+
+  const requestedRef = resolveRequestedAgentReference(text, registeredAgents);
+  if (requestedRef) {
+    return {
+      mode: 'agent_delegation',
+      reason: `用户明确指派 Agent「${requestedRef.agentId}」执行任务`,
+      confidence: 0.92,
+      matched: [requestedRef.rawMention],
+      requestedAgentId: requestedRef.agentId,
+    };
   }
 
   const matched: string[] = [];
@@ -157,19 +191,32 @@ export function understandIntent(text: string, keywords: readonly string[]): Int
     }
   }
 
-  // 需要真实执行/工具/仓库上下文的请求才委派 Agent。
+  // 需要真实执行/工具/仓库上下文的请求才委派 Agent；单纯咨询或探讨想法不误触发。
   const actionVerbs: readonly string[] = [
-    '帮我', '请', '实现', '修复', '重构', '分析', '检查', '排查', '调研', '编写',
-    '写代码', '跑', '执行', '扫描', '生成代码', '提交', '部署', '评估',
-    'implement', 'fix', 'refactor', 'analyze', 'investigate', 'build', 'run',
+    '帮我', '请', '实现', '修复', '重构', '分析', '检查', '排查', '调研', '研究', '编写',
+    '写代码', '跑', '执行', '扫描', '生成代码', '提交', '部署', '评估', '整理',
+    'implement', 'fix', 'refactor', 'analyze', 'investigate', 'research', 'build', 'run',
   ];
   const hasAction: boolean = actionVerbs.some((verb: string): boolean => normalized.includes(verb));
+
+  const patternHits = EXECUTION_WORK_PATTERNS.filter((entry) => entry.pattern.test(text)).map(
+    (entry) => entry.label,
+  );
+
+  if (patternHits.length > 0 && hasAction) {
+    return {
+      mode: 'agent_delegation',
+      reason: `识别到明确工作执行诉求（${patternHits.join('、')}），交由合适 Agent 执行`,
+      confidence: 0.86,
+      matched: [...matched, ...patternHits],
+    };
+  }
 
   if (matched.length > 0 && hasAction) {
     const confidence: number = Math.min(0.95, 0.55 + matched.length * 0.12);
     return {
       mode: 'agent_delegation',
-      reason: `命中可执行任务关键词（${matched.slice(0, 4).join('、')}）且包含动作诉求，委派 MultiCA Agent`,
+      reason: `命中可执行任务关键词（${matched.slice(0, 4).join('、')}）且包含动作诉求，委派 Agent`,
       confidence,
       matched,
     };

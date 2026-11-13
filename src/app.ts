@@ -186,6 +186,7 @@ export async function createApp(
       personalAI.directRunner.abortAll();
       personalAI.openClawRunner.abortAll();
       personalAI.worker.stop();
+      personalAI.proactiveScheduler.stop();
       await background.wait();
       await deps.queue.whenIdle();
       db.close();

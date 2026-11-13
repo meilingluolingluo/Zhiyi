@@ -19,6 +19,7 @@ export function planExecution(
   intent: IntentResult,
   context: BuiltContext,
   config: PersonalAIConfig,
+  options: { hasDirectBackendAgents?: boolean } = {},
 ): ExecutionPlan {
   const title: string = oneLine(context.taskText, 80) || '知忆任务';
   const memorySummary: string = context.hits
@@ -35,12 +36,12 @@ export function planExecution(
     };
   }
 
-  if (!config.multica.enabled) {
+  if (!config.multica.enabled && !options.hasDirectBackendAgents && !intent.requestedAgentId) {
     return {
       mode: 'direct_llm',
       title,
       description: context.taskText.slice(0, 2000),
-      reason: `本可委派 Agent（${intent.reason}），但 MULTICA_ENABLED=false，降级为直接模型回答`,
+      reason: `本可委派 Agent（${intent.reason}），但 MULTICA_ENABLED=false 且无可用进程内 Agent，降级为直接模型回答`,
     };
   }
 

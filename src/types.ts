@@ -5,6 +5,15 @@
 
 export type MemoryType = 'identity' | 'episodic' | 'semantic' | 'procedural' | 'working';
 export type MemoryScope = 'personal' | 'agent' | 'project' | 'organization';
+export type MemoryStatus = 'active' | 'archived' | 'superseded';
+export type MemoryCategory =
+  | 'profile_fact'
+  | 'preference'
+  | 'goal'
+  | 'project_fact'
+  | 'experience'
+  | 'event'
+  | 'general';
 export type CandidateStatus = 'pending' | 'low_confidence' | 'approved' | 'rejected';
 
 export const MEMORY_TYPES: readonly MemoryType[] = [
@@ -22,17 +31,41 @@ export const MEMORY_SCOPES: readonly MemoryScope[] = [
   'organization',
 ];
 
+export const MEMORY_STATUSES: readonly MemoryStatus[] = [
+  'active',
+  'archived',
+  'superseded',
+];
+
+export const MEMORY_CATEGORIES: readonly MemoryCategory[] = [
+  'profile_fact',
+  'preference',
+  'goal',
+  'project_fact',
+  'experience',
+  'event',
+  'general',
+];
+
 /** 正式记忆记录。 */
 export interface Memory {
   memory_id: string;
   user_id: string;
   agent_id: string | null;
   project_id: string | null;
+  goal_id: string | null;
+  task_id: string | null;
   type: MemoryType;
   scope: MemoryScope;
+  category: MemoryCategory;
+  status: MemoryStatus;
   content: string;
   source: string;
   confidence: number;
+  verified_by_user: boolean;
+  expires_at: string | null;
+  superseded_by: string | null;
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -42,11 +75,17 @@ export interface NewMemory {
   user_id: string;
   agent_id?: string | null;
   project_id?: string | null;
+  goal_id?: string | null;
+  task_id?: string | null;
   type?: MemoryType;
   scope?: MemoryScope;
+  category?: MemoryCategory;
+  status?: MemoryStatus;
   content: string;
   source?: string;
   confidence?: number;
+  verified_by_user?: boolean;
+  expires_at?: string | null;
 }
 
 /** 记忆更新入参。 */
@@ -54,18 +93,31 @@ export interface MemoryPatch {
   content?: string;
   type?: MemoryType;
   scope?: MemoryScope;
+  category?: MemoryCategory;
+  status?: MemoryStatus;
   agent_id?: string | null;
   project_id?: string | null;
+  goal_id?: string | null;
+  task_id?: string | null;
   source?: string;
   confidence?: number;
+  verified_by_user?: boolean;
+  expires_at?: string | null;
+  superseded_by?: string | null;
+  archived_at?: string | null;
 }
 
 /** 记忆列表过滤条件。 */
 export interface MemoryFilters {
   agent_id?: string;
   project_id?: string;
+  goal_id?: string;
+  task_id?: string;
   type?: MemoryType;
   scope?: MemoryScope;
+  category?: MemoryCategory;
+  status?: MemoryStatus;
+  include_archived?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -173,11 +225,15 @@ export interface MemoryCandidate {
   user_id: string;
   agent_id: string | null;
   project_id: string | null;
+  goal_id: string | null;
+  task_id: string | null;
   type: MemoryType;
   scope: MemoryScope;
+  category: MemoryCategory;
   content: string;
   source: string;
   trajectory_id: string | null;
+  conflict_memory_id: string | null;
   confidence: number;
   status: CandidateStatus;
   created_memory_id: string | null;
@@ -189,6 +245,7 @@ export interface MemoryCandidate {
 export interface ExtractedCandidate {
   type: MemoryType;
   scope: MemoryScope;
+  category?: MemoryCategory;
   content: string;
   confidence: number;
   reason: string;

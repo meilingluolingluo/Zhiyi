@@ -49,6 +49,9 @@ const MIGRATIONS: readonly string[] = [
   '002_trajectory_request_scope',
   '003_personal_ai',
   '004_v1_5_phase1',
+  '005_execution_lifecycle',
+  '006_memory_evolution',
+  '007_proactive_assistant',
 ];
 
 /** 定位迁移脚本：优先工作目录，其次相对编译产物目录。 */

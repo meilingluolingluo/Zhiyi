@@ -10,7 +10,7 @@ import type { ResolvedIdentity } from '../../identity';
 import type { Logger } from '../../logger';
 import type { MemoryStore } from '../../memories';
 import type { AgentProfile, ChatMessage } from '../../types';
-import type { ModelAdapter, TokenUsage } from '../adapters/model/model-adapter';
+import { ModelAdapterError, type ModelAdapter, type TokenUsage } from '../adapters/model/model-adapter';
 import type { BusinessTask } from '../domain/types';
 import type { PersonalAIIdentity } from '../identity/identity-manager';
 import type { BusinessTaskManager } from '../task/business-task-manager';
@@ -108,10 +108,16 @@ export class DirectExecutionRunner {
         return;
       }
       const message: string = error instanceof Error ? error.message : String(error);
+      const statusCode: number | undefined =
+        error instanceof ModelAdapterError ? error.status : undefined;
+      const errorCode: string | undefined =
+        error instanceof Error && error.name === 'TimeoutError' ? 'upstream_timeout' : undefined;
       this.deps.logger.warn(`[direct-runner] 执行 ${execution.id} 失败: ${message}`);
       this.deps.businessTaskManager.finishDirectExecution(execution.id, {
         status: 'failed',
         error: message,
+        statusCode,
+        errorCode,
       });
       if (options.rethrowOnError) throw error;
     } finally {

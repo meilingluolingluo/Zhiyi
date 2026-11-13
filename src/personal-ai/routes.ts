@@ -344,6 +344,25 @@ export function createPersonalAIRouter(deps: PersonalAIRouterDeps): Router {
     res.json(task);
   });
 
+  router.get('/v1/personal-ai/tasks/:id/events', (req, res): void => {
+    const auth = identify(req, deps);
+    if (!auth.ok) {
+      authFailure(res, auth.status, auth.error);
+      return;
+    }
+    const limitParsed = Number(req.query.limit);
+    const offsetParsed = Number(req.query.offset);
+    const limit =
+      Number.isFinite(limitParsed) && limitParsed > 0 ? Math.min(200, Math.floor(limitParsed)) : 100;
+    const offset = Number.isFinite(offsetParsed) && offsetParsed >= 0 ? Math.floor(offsetParsed) : 0;
+    const page = deps.taskManager.listEvents(auth.identity.user_id, req.params.id, limit, offset);
+    if (!page) {
+      res.status(404).json(errorBody('任务不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ ...page, limit, offset });
+  });
+
   router.post('/v1/personal-ai/tasks/:id/cancel', async (req, res): Promise<void> => {
     const auth = identify(req, deps);
     if (!auth.ok) {

@@ -17,6 +17,12 @@ import { errorBody } from './errors';
 import type { MockMode } from './mock-upstream';
 import { resolveIdentity, type HeaderBag, type ResolvedIdentity } from './identity';
 import { DomainError } from './personal-ai/domain/types';
+import {
+  correctMemory,
+  evolveMemoryWrite,
+  MemoryConflictError,
+  mutateMemoryWithGuard,
+} from './memory-evolution';
 import { handleChatCompletion } from './proxy';
 import { searchMemories } from './search';
 import {
@@ -26,11 +32,15 @@ import {
 } from './upstream/media-handlers';
 import { isValidImageFilename } from './upstream/media-store';
 import {
+  MEMORY_CATEGORIES,
   MEMORY_SCOPES,
+  MEMORY_STATUSES,
   MEMORY_TYPES,
   type AgentAdminPatch,
   type CandidateStatus,
+  type MemoryCategory,
   type MemoryScope,
+  type MemoryStatus,
   type MemoryType,
 } from './types';
 
@@ -131,7 +141,7 @@ export function createRouter(deps: AppDeps): Router {
     });
   });
 
-  // ===== 记忆 CRUD =====
+  // ===== 记忆 CRUD 与进化治理 =====
   router.post('/v1/memories', (req: ExpressRequest, res: ExpressResponse): void => {
     const body = bodyOf(req);
     if (typeof body.content !== 'string' || body.content.trim() === '') {
@@ -142,42 +152,86 @@ export function createRouter(deps: AppDeps): Router {
     const scope: MemoryScope = MEMORY_SCOPES.includes(body.scope as MemoryScope)
       ? (body.scope as MemoryScope)
       : 'personal';
-    const memory = deps.memoryStore.create({
-      user_id: identity.user_id,
-      // body 中的 user_id / agent_id 属于身份字段，一律忽略；
-      // agent 专属记忆通过 scope=agent 自动归属到服务端解析出的 agent_id。
-      agent_id: scope === 'agent' ? identity.agent_id : null,
-      project_id:
-        typeof body.project_id === 'string'
-          ? body.project_id
-          : scope === 'project'
-            ? identity.project_id
-            : null,
-      type: MEMORY_TYPES.includes(body.type as MemoryType) ? (body.type as MemoryType) : 'semantic',
-      scope,
-      content: body.content.trim(),
-      source: typeof body.source === 'string' ? body.source : 'api',
-      confidence: typeof body.confidence === 'number' ? body.confidence : 0.8,
+    const source: string = typeof body.source === 'string' ? body.source.trim() || 'api' : 'api';
+    const isModelActor = source === 'model-inference' || source === 'auto-extract';
+    const evolved = evolveMemoryWrite(
+      deps.memoryStore,
+      {
+        user_id: identity.user_id,
+        // body 中的 user_id / agent_id 属于身份字段，一律忽略；
+        // agent 专属记忆通过 scope=agent 自动归属到服务端解析出的 agent_id。
+        agent_id: scope === 'agent' ? identity.agent_id : null,
+        project_id:
+          typeof body.project_id === 'string'
+            ? body.project_id
+            : scope === 'project'
+              ? identity.project_id
+              : null,
+        goal_id: typeof body.goal_id === 'string' && body.goal_id.trim() !== '' ? body.goal_id.trim() : null,
+        task_id: typeof body.task_id === 'string' && body.task_id.trim() !== '' ? body.task_id.trim() : null,
+        type: MEMORY_TYPES.includes(body.type as MemoryType) ? (body.type as MemoryType) : 'semantic',
+        scope,
+        category: MEMORY_CATEGORIES.includes(body.category as MemoryCategory)
+          ? (body.category as MemoryCategory)
+          : 'general',
+        content: body.content.trim(),
+        source,
+        confidence: typeof body.confidence === 'number' ? body.confidence : 0.8,
+        expires_at: typeof body.expires_at === 'string' && body.expires_at.trim() !== '' ? body.expires_at.trim() : null,
+      },
+      {
+        actor: isModelActor ? 'model' : 'user',
+        supersedeConflicts: body.supersede_conflicts !== false,
+      },
+    );
+    if (evolved.action === 'conflict_blocked') {
+      res.status(409).json({
+        ...errorBody(evolved.reason, 'conflict_blocked'),
+        conflict_memory_id: evolved.conflictWith.memory_id,
+      });
+      return;
+    }
+    res.status(201).json({
+      memory: evolved.memory,
+      evolution_action: evolved.action,
+      ...(evolved.action === 'superseded' ? { superseded_ids: evolved.superseded.map((m) => m.memory_id) } : {}),
     });
-    res.status(201).json({ memory });
   });
 
   router.get('/v1/memories', (req: ExpressRequest, res: ExpressResponse): void => {
     const identity: ResolvedIdentity = identityOf(res);
+    const includeArchived = String(req.query.include_archived ?? '').toLowerCase() === 'true';
     const filters: Record<string, unknown> = {
       limit: queryInt(req.query.limit, 50),
       offset: queryInt(req.query.offset, 0),
+      include_archived: includeArchived,
     };
     const agentId: string | undefined = queryString(req.query.agent_id);
     const projectId: string | undefined = queryString(req.query.project_id);
+    const goalId: string | undefined = queryString(req.query.goal_id);
+    const taskId: string | undefined = queryString(req.query.task_id);
     const type: string | undefined = queryString(req.query.type);
     const scope: string | undefined = queryString(req.query.scope);
+    const category: string | undefined = queryString(req.query.category);
+    const status: string | undefined = queryString(req.query.status);
     if (agentId) filters.agent_id = agentId;
     if (projectId) filters.project_id = projectId;
+    if (goalId) filters.goal_id = goalId;
+    if (taskId) filters.task_id = taskId;
     if (type && MEMORY_TYPES.includes(type as MemoryType)) filters.type = type as MemoryType;
     if (scope && MEMORY_SCOPES.includes(scope as MemoryScope)) filters.scope = scope as MemoryScope;
+    if (category && MEMORY_CATEGORIES.includes(category as MemoryCategory)) {
+      filters.category = category as MemoryCategory;
+    }
+    if (status && MEMORY_STATUSES.includes(status as MemoryStatus)) {
+      filters.status = status as MemoryStatus;
+    }
     const items = deps.memoryStore.list(identity.user_id, filters);
-    res.json({ items, count: items.length, total: deps.memoryStore.count(identity.user_id) });
+    res.json({
+      items,
+      count: items.length,
+      total: deps.memoryStore.count(identity.user_id, includeArchived),
+    });
   });
 
   router.post('/v1/memories/search', (req: ExpressRequest, res: ExpressResponse): void => {
@@ -187,6 +241,10 @@ export function createRouter(deps: AppDeps): Router {
       return;
     }
     const identity: ResolvedIdentity = identityOf(res);
+    const rawCats: unknown[] = Array.isArray(body.categories) ? body.categories : [];
+    const categories = rawCats.filter((c): c is MemoryCategory =>
+      MEMORY_CATEGORIES.includes(c as MemoryCategory),
+    );
     const hits = searchMemories(deps.memoryStore, {
       query: body.query,
       user_id: identity.user_id,
@@ -195,7 +253,11 @@ export function createRouter(deps: AppDeps): Router {
       agent_id: identity.agent_id,
       project_id:
         typeof body.project_id === 'string' ? body.project_id : identity.project_id,
+      goal_id: typeof body.goal_id === 'string' ? body.goal_id : undefined,
+      task_id: typeof body.task_id === 'string' ? body.task_id : undefined,
       scopes: parseScopes(body.scopes),
+      categories: categories.length > 0 ? categories : undefined,
+      include_archived: body.include_archived === true,
       limit: typeof body.limit === 'number' ? body.limit : 10,
     });
     res.json({ query: body.query, count: hits.length, results: hits });
@@ -216,16 +278,77 @@ export function createRouter(deps: AppDeps): Router {
       invalid(res, 'content 不能为空');
       return;
     }
-    const updated = deps.memoryStore.update(
-      identityOf(res).user_id,
-      req.params.id,
-      body as Parameters<typeof deps.memoryStore.update>[2],
-    );
-    if (!updated) {
-      notFound(res, '记忆');
+    const isModelActor = body.source === 'model-inference' || body.source === 'auto-extract';
+    try {
+      const updated = mutateMemoryWithGuard(
+        deps.memoryStore,
+        identityOf(res).user_id,
+        req.params.id,
+        { kind: 'update', patch: body as Parameters<typeof deps.memoryStore.update>[2] },
+        { actor: isModelActor ? 'model' : 'user', userConfirmedCorrection: !isModelActor },
+      );
+      res.json({ memory: updated });
+    } catch (error) {
+      if (error instanceof MemoryConflictError) {
+        res.status(error.status).json(errorBody(error.message, error.code));
+        return;
+      }
+      throw error;
+    }
+  });
+
+  router.post('/v1/memories/:id/archive', (req: ExpressRequest, res: ExpressResponse): void => {
+    try {
+      const archived = mutateMemoryWithGuard(
+        deps.memoryStore,
+        identityOf(res).user_id,
+        req.params.id,
+        { kind: 'archive' },
+        { actor: 'user', userConfirmedCorrection: true },
+      );
+      res.json({ memory: archived });
+    } catch (error) {
+      if (error instanceof MemoryConflictError) {
+        res.status(error.status).json(errorBody(error.message, error.code));
+        return;
+      }
+      throw error;
+    }
+  });
+
+  router.post('/v1/memories/:id/correct', (req: ExpressRequest, res: ExpressResponse): void => {
+    const body = bodyOf(req);
+    if (typeof body.content !== 'string' || body.content.trim() === '') {
+      invalid(res, 'content 不能为空');
       return;
     }
-    res.json({ memory: updated });
+    try {
+      const result = correctMemory(
+        deps.memoryStore,
+        identityOf(res).user_id,
+        req.params.id,
+        {
+          content: body.content.trim(),
+          category: MEMORY_CATEGORIES.includes(body.category as MemoryCategory)
+            ? (body.category as MemoryCategory)
+            : undefined,
+          expires_at:
+            typeof body.expires_at === 'string'
+              ? body.expires_at.trim() || null
+              : body.expires_at === null
+                ? null
+                : undefined,
+        },
+        { actor: 'user', userConfirmedCorrection: true },
+      );
+      res.json({ memory: result.corrected, superseded: result.superseded });
+    } catch (error) {
+      if (error instanceof MemoryConflictError) {
+        res.status(error.status).json(errorBody(error.message, error.code));
+        return;
+      }
+      throw error;
+    }
   });
 
   router.delete('/v1/memories/:id', (req: ExpressRequest, res: ExpressResponse): void => {

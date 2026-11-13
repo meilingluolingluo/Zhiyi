@@ -26,13 +26,24 @@ import type { GoalStore } from '../domain/goal-store';
 import type { ProjectStore } from '../domain/project-store';
 import type { BusinessTask } from '../domain/types';
 import type { UserProfileStore } from '../domain/user-profile-store';
+import type { ProactiveStore } from '../proactive/proactive-store';
+import {
+  createGoalForUser,
+  createProjectForUser,
+  createTaskForUser,
+  extractPriorConversationMessages,
+} from '../domain/work-operations';
 import type { PersonalAIEvent } from '../events/event-types';
 import type { PersonalAIIdentity } from '../identity/identity-manager';
 import type { BusinessTaskManager } from '../task/business-task-manager';
 import type { TaskManager } from '../task/task-manager';
 import type { ExecutionTask } from '../task/task-repository';
 import type { TaskWorker } from '../worker/task-worker';
-import type { AgentSelector } from './agent-selector';
+import {
+  resolveRequestedAgentReference,
+  type AgentSelectionOutcome,
+  type AgentSelector,
+} from './agent-selector';
 import { buildPersonalAIContext, type BuiltContext } from './context-builder';
 import type { DirectExecutionRunner } from './direct-execution-runner';
 import type { OpenClawAgentRunner } from './openclaw/agent-runner';
@@ -69,6 +80,7 @@ export interface RuntimeDeps {
   goalStore?: GoalStore;
   projectStore?: ProjectStore;
   businessTaskManager?: BusinessTaskManager;
+  proactiveStore?: ProactiveStore;
   agentSelector?: AgentSelector;
   directRunner?: DirectExecutionRunner;
   openClawRunner?: OpenClawAgentRunner;
@@ -200,6 +212,28 @@ export class PersonalAIRuntime {
     return undefined;
   }
 
+  private selectAgentOutcome(params: {
+    taskText: string;
+    identity: PersonalAIIdentity;
+    userRequestedAgentId?: string;
+    intentAgentId?: string;
+    defaultAgentId?: string;
+  }): AgentSelectionOutcome | undefined {
+    if (!this.deps.agentSelector) return undefined;
+    // 用户在对话中显式点名 Agent 时按用户输入严格解析，避免静默转派其他 Agent；未点名时允许回退匹配。
+    const preferredAgentId: string | undefined =
+      params.userRequestedAgentId ??
+      this.resolveExplicitPreferredAgent(params.identity, params.intentAgentId);
+    const allowFallback: boolean = !params.userRequestedAgentId;
+    return this.deps.agentSelector.selectWithDiagnostics({
+      taskText: params.taskText,
+      preferredAgentId,
+      multicaEnabled: this.deps.personalAI.multica.enabled,
+      defaultAgentId: params.defaultAgentId,
+      allowFallback,
+    });
+  }
+
   private prepareExecutionRecord(
     identity: PersonalAIIdentity,
     title: string,
@@ -321,7 +355,14 @@ export class PersonalAIRuntime {
     capture: { text: string },
   ): AsyncGenerator<PersonalAIEvent> {
     this.deps.conversationStore.touch(identity, execution.id);
-    if (created) yield { type: 'task_started', taskId: execution.id };
+    if (created) {
+      yield {
+        type: 'task_started',
+        taskId: execution.id,
+        mode: 'multica',
+        agentId: execution.agent_id ?? undefined,
+      };
+    }
     if (created) await this.deps.worker.dispatch(execution.id);
 
     let lastStatus = '';
@@ -354,19 +395,35 @@ export class PersonalAIRuntime {
         }
         capture.text = aggregateAgentResult({
           taskId: execution.id,
+          businessTaskId: current.task_id,
           agentId: current.agent_id ?? undefined,
           content: current.result ?? undefined,
         });
         yield { type: 'final_answer', content: capture.text };
         break;
       }
-      if (current.status === 'failed' || current.status === 'cancelled') {
+      if (current.status === 'cancelled') {
+        const reason: string = current.error ?? '任务已取消';
+        yield { type: 'task_cancelled', taskId: execution.id, reason };
+        capture.text = `任务 ${execution.id} 已取消${current.error ? `：${current.error}` : ''}`;
+        yield { type: 'final_answer', content: capture.text };
+        break;
+      }
+      if (current.status === 'failed') {
         yield {
           type: 'task_failed',
           taskId: execution.id,
           error: current.error ?? '任务失败',
         };
-        capture.text = aggregateAgentResult({ taskId: execution.id, error: current.error ?? '任务失败' });
+        capture.text = aggregateAgentResult({
+          taskId: execution.id,
+          businessTaskId: current.task_id,
+          agentId: current.agent_id ?? undefined,
+          error: current.error ?? '任务失败',
+          errorCategory: current.error_category,
+          retryable: current.retryable,
+          needsVerification: current.needs_verification,
+        });
         yield { type: 'final_answer', content: capture.text };
         break;
       }
@@ -383,6 +440,36 @@ export class PersonalAIRuntime {
     }
   }
 
+  private async *handleDirectDelegationError(
+    error: unknown,
+    businessTask: BusinessTask,
+    execution: ExecutionTask,
+    agent: AgentProfile,
+    identity: PersonalAIIdentity,
+    signal: AbortSignal | undefined,
+    capture: { text: string },
+  ): AsyncGenerator<PersonalAIEvent> {
+    const message: string = error instanceof Error ? error.message : String(error);
+    if (signal?.aborted || message === '用户取消任务') {
+      yield { type: 'task_cancelled', taskId: execution.id, reason: '用户取消任务' };
+      capture.text = `任务 ${execution.id} 已取消`;
+      yield { type: 'final_answer', content: capture.text };
+      return;
+    }
+    const latest = this.deps.taskManager.getForUser(identity.user_id, execution.id);
+    yield { type: 'task_failed', taskId: execution.id, error: message };
+    capture.text = aggregateAgentResult({
+      taskId: execution.id,
+      businessTaskId: businessTask.id,
+      agentId: agent.agent_id,
+      error: latest?.error ?? message,
+      errorCategory: latest?.error_category,
+      retryable: latest?.retryable,
+      needsVerification: latest?.needs_verification,
+    });
+    yield { type: 'final_answer', content: capture.text };
+  }
+
   private async *runDirectAgentDelegation(
     businessTask: BusinessTask,
     execution: ExecutionTask,
@@ -394,9 +481,13 @@ export class PersonalAIRuntime {
     usageOut: TokenUsage | undefined,
     capture: { text: string },
     publicOrigin?: string,
+    historyMessages?: ChatMessage[],
   ): AsyncGenerator<PersonalAIEvent> {
+    const executionMode: 'openclaw' | 'direct_llm' = isOpenClawAgent(agent)
+      ? 'openclaw'
+      : 'direct_llm';
     this.deps.conversationStore.touch(identity, execution.id);
-    yield { type: 'task_started', taskId: execution.id };
+    yield { type: 'task_started', taskId: execution.id, mode: executionMode, agentId: agent.agent_id };
     yield { type: 'agent_started', taskId: execution.id, agentId: agent.agent_id };
 
     if (isOpenClawAgent(agent) && this.deps.openClawRunner) {
@@ -411,6 +502,7 @@ export class PersonalAIRuntime {
             signal,
             modelOverride: modelName,
             publicOrigin,
+            historyMessages,
             onUsage: (usage: TokenUsage): void => {
               if (usageOut) {
                 usageOut.prompt_tokens += usage.prompt_tokens;
@@ -428,10 +520,15 @@ export class PersonalAIRuntime {
         }
         yield { type: 'agent_completed', taskId: execution.id, agentId: agent.agent_id };
       } catch (error) {
-        const message: string = error instanceof Error ? error.message : String(error);
-        yield { type: 'task_failed', taskId: execution.id, error: message };
-        capture.text = aggregateAgentResult({ taskId: execution.id, error: message });
-        yield { type: 'final_answer', content: capture.text };
+        yield* this.handleDirectDelegationError(
+          error,
+          businessTask,
+          execution,
+          agent,
+          identity,
+          signal,
+          capture,
+        );
       }
       return;
     }
@@ -440,7 +537,12 @@ export class PersonalAIRuntime {
       // 无 DirectExecutionRunner 注入时的安全降级
       const fallbackError = 'DirectExecutionRunner 未配置';
       yield { type: 'task_failed', taskId: execution.id, error: fallbackError };
-      capture.text = aggregateAgentResult({ taskId: execution.id, error: fallbackError });
+      capture.text = aggregateAgentResult({
+        taskId: execution.id,
+        businessTaskId: businessTask.id,
+        agentId: agent.agent_id,
+        error: fallbackError,
+      });
       yield { type: 'final_answer', content: capture.text };
       return;
     }
@@ -459,10 +561,15 @@ export class PersonalAIRuntime {
       }
       yield { type: 'agent_completed', taskId: execution.id, agentId: agent.agent_id };
     } catch (error) {
-      const message: string = error instanceof Error ? error.message : String(error);
-      yield { type: 'task_failed', taskId: execution.id, error: message };
-      capture.text = aggregateAgentResult({ taskId: execution.id, error: message });
-      yield { type: 'final_answer', content: capture.text };
+      yield* this.handleDirectDelegationError(
+        error,
+        businessTask,
+        execution,
+        agent,
+        identity,
+        signal,
+        capture,
+      );
     }
   }
 
@@ -480,6 +587,7 @@ export class PersonalAIRuntime {
     usageOut: TokenUsage | undefined,
     capture: { text: string },
     publicOrigin?: string,
+    historyMessages?: ChatMessage[],
   ): AsyncGenerator<PersonalAIEvent> {
     if (prepared.execution.execution_mode === 'direct_llm') {
       if (prepared.created && prepared.businessTask && prepared.agent) {
@@ -494,6 +602,7 @@ export class PersonalAIRuntime {
           usageOut,
           capture,
           publicOrigin,
+          historyMessages,
         );
         return;
       }
@@ -534,8 +643,9 @@ export class PersonalAIRuntime {
     timezone?: string,
   ): string | null {
     const userOptions = { headerTimezone: timezone };
-    if (intent.action === 'create_goal' && this.deps.goalStore) {
-      const goal = this.deps.goalStore.create(
+    if (intent.action === 'create_goal' && this.deps.goalStore && this.deps.projectStore) {
+      const goal = createGoalForUser(
+        { goalStore: this.deps.goalStore, projectStore: this.deps.projectStore },
         identity.user_id,
         {
           title: intent.title as string,
@@ -543,49 +653,45 @@ export class PersonalAIRuntime {
           priority: intent.priority,
           target_date: intent.target_date ?? null,
         },
-        userOptions,
+        { filterForeignProjects: true, userOptions },
       );
       return `[知忆] 已为你创建目标：「${goal.title}」（ID: \`${goal.id}\`，优先级 P${goal.priority}）。`;
     }
 
-    if (intent.action === 'create_project' && this.deps.projectStore) {
-      const ownedGoalIds: string[] = (intent.goal_ids ?? []).filter(
-        (gid: string): boolean => this.deps.goalStore?.get(identity.user_id, gid) !== undefined,
-      );
-      const project = this.deps.projectStore.create(
+    if (intent.action === 'create_project' && this.deps.projectStore && this.deps.goalStore) {
+      const project = createProjectForUser(
+        { projectStore: this.deps.projectStore, goalStore: this.deps.goalStore },
         identity.user_id,
         {
           title: intent.title as string,
           description: intent.description ?? '',
-          goal_ids: ownedGoalIds,
+          goal_ids: intent.goal_ids,
         },
-        userOptions,
+        { filterForeignGoals: true, userOptions },
       );
       return `[知忆] 已为你创建项目：「${project.title}」（ID: \`${project.id}\`）。`;
     }
 
-    if (intent.action === 'create_task' && this.deps.businessTaskManager) {
-      const ownedProjectId: string | null =
-        intent.project_id && this.deps.projectStore?.get(identity.user_id, intent.project_id)
-          ? intent.project_id
-          : null;
-      const requestedAgent: AgentProfile | undefined = intent.preferred_agent_id
-        ? this.deps.agentStore.get(intent.preferred_agent_id)
-        : undefined;
-      const activeAgentId: string | null =
-        requestedAgent && requestedAgent.status === 'active' ? requestedAgent.agent_id : null;
-
-      const task = this.deps.businessTaskManager.create(
+    if (
+      intent.action === 'create_task' &&
+      this.deps.businessTaskManager &&
+      this.deps.projectStore
+    ) {
+      const task = createTaskForUser(
+        {
+          businessTaskManager: this.deps.businessTaskManager,
+          projectStore: this.deps.projectStore,
+          agentStore: this.deps.agentStore,
+        },
         identity.user_id,
         {
           title: intent.title as string,
           description: intent.description ?? '',
-          project_id: ownedProjectId,
+          project_id: intent.project_id,
           priority: intent.priority,
-          assignee_agent_id: activeAgentId,
-          status: activeAgentId ? 'assigned' : 'pending',
+          assignee_agent_id: intent.preferred_agent_id,
         },
-        userOptions,
+        { sanitizeForeignRefs: true, userOptions },
       );
       const assigneeNote: string = task.assignee_agent_id ? `，指派给 ${task.assignee_agent_id}` : '';
       return `[知忆] 已记录待办任务：「${task.title}」（ID: \`${task.id}\`，状态 ${task.status}${assigneeNote}）。`;
@@ -631,6 +737,7 @@ export class PersonalAIRuntime {
           goalStore: this.deps.goalStore,
           projectStore: this.deps.projectStore,
           businessTaskManager: this.deps.businessTaskManager,
+          proactiveStore: this.deps.proactiveStore,
         },
         identity,
         messages,
@@ -678,19 +785,32 @@ export class PersonalAIRuntime {
         return;
       }
 
+      const currentTurnPrompt: string = userPrompt !== '' ? userPrompt : context.taskText;
+      const historyMessages = extractPriorConversationMessages(messages);
+      const registeredAgents: AgentProfile[] = this.deps.agentStore.list();
+      const userRequestedAgentId: string | undefined = resolveRequestedAgentReference(
+        currentTurnPrompt,
+        registeredAgents,
+      )?.agentId;
+
       if (structured && structured.action === 'delegate_task') {
-        const selected = this.deps.agentSelector?.select({
-          taskText: [structured.title, structured.description, context.taskText]
-            .filter(Boolean)
-            .join('\n'),
-          preferredAgentId: this.resolveExplicitPreferredAgent(
-            identity,
-            structured.preferred_agent_id,
-          ),
-          multicaEnabled: this.deps.personalAI.multica.enabled,
+        const delegationText = [structured.title, structured.description, currentTurnPrompt]
+          .filter(Boolean)
+          .join('\n');
+        const outcome = this.selectAgentOutcome({
+          taskText: delegationText,
+          identity,
+          userRequestedAgentId,
+          intentAgentId: structured.preferred_agent_id,
           defaultAgentId: this.deps.personalAI.multica.defaultAgent || undefined,
         });
-        const pickedAgent: AgentProfile | null = selected?.agent ?? null;
+        if (outcome?.unavailable) {
+          const unavailableText = `[知忆] 无法委派任务：${outcome.unavailable.message}。`;
+          capture.text = unavailableText;
+          yield { type: 'text_delta', content: unavailableText };
+          return;
+        }
+        const pickedAgent: AgentProfile | null = outcome?.selected?.agent ?? null;
 
         if (!pickedAgent && !this.deps.personalAI.multica.enabled) {
           this.deps.logger.info(
@@ -713,14 +833,14 @@ export class PersonalAIRuntime {
             : null;
         const prepared = this.prepareExecutionRecord(
           identity,
-          structured.title ?? (oneLine(context.taskText, 80) || '知忆任务'),
-          structured.description ?? context.taskText.slice(0, 2000),
+          structured.title ?? (oneLine(currentTurnPrompt, 80) || '知忆任务'),
+          structured.description ?? currentTurnPrompt.slice(0, 2000),
           pickedAgent,
           ownedProjectId,
           input.timezone,
         );
         this.deps.logger.info(
-          `[personal-ai] mode=${prepared.execution.execution_mode} agent=${prepared.agent?.agent_id ?? 'default'} reason=${selected?.reason ?? structured.reason}`,
+          `[personal-ai] mode=${prepared.execution.execution_mode} agent=${prepared.agent?.agent_id ?? 'default'} reason=${outcome?.selected?.reason ?? structured.reason}`,
         );
 
         yield* this.dispatchPreparedDelegation(
@@ -732,16 +852,29 @@ export class PersonalAIRuntime {
           input.usage,
           capture,
           input.publicOrigin,
+          historyMessages,
         );
         return;
       }
 
-      // 显式通过 x-agent-id / API Key 指定了 OpenClaw Agent（非问候快路径）时，直接进入 OpenClaw 执行分支
+      // 显式通过服务端 API Key 指定了 OpenClaw Agent 且用户未点名转派其他 Agent 时，直接进入该 OpenClaw 执行分支；已禁用则拒绝。
       const explicitAgentId: string | undefined = this.resolveExplicitPreferredAgent(identity);
       const explicitOpenClawAgent: AgentProfile | undefined =
-        explicitAgentId && !isGreetingOnly(context.taskText)
+        explicitAgentId &&
+        !isGreetingOnly(currentTurnPrompt) &&
+        (!userRequestedAgentId || userRequestedAgentId === explicitAgentId)
           ? this.deps.agentStore.get(explicitAgentId)
           : undefined;
+      if (
+        explicitOpenClawAgent &&
+        isOpenClawAgent(explicitOpenClawAgent) &&
+        explicitOpenClawAgent.status !== 'active'
+      ) {
+        const disabledMsg = `Agent ${explicitOpenClawAgent.agent_id} 已禁用，禁止继续调用工具或执行任务`;
+        capture.text = `[错误] ${disabledMsg}`;
+        yield { type: 'error', message: disabledMsg };
+        return;
+      }
       if (
         explicitOpenClawAgent &&
         explicitOpenClawAgent.status === 'active' &&
@@ -750,8 +883,8 @@ export class PersonalAIRuntime {
       ) {
         const prepared = this.prepareExecutionRecord(
           identity,
-          oneLine(context.taskText, 80) || '知忆 OpenClaw 任务',
-          context.taskText.slice(0, 2000),
+          oneLine(currentTurnPrompt, 80) || '知忆 OpenClaw 任务',
+          currentTurnPrompt.slice(0, 2000),
           explicitOpenClawAgent,
           null,
           input.timezone,
@@ -768,13 +901,26 @@ export class PersonalAIRuntime {
           input.usage,
           capture,
           input.publicOrigin,
+          historyMessages,
         );
         return;
       }
 
       // V1 规则路由（默认或 LLM 意图不可用/未命中时的安全回退）
-      const intent = understandIntent(context.taskText, this.deps.personalAI.agentKeywords);
-      const plan = planExecution(intent, context, this.deps.personalAI);
+      const hasDirectBackendAgents: boolean = registeredAgents.some(
+        (agent): boolean => agent.status === 'active' && agent.execution_backend === 'direct_llm',
+      );
+      const intent = understandIntent(
+        currentTurnPrompt,
+        this.deps.personalAI.agentKeywords,
+        registeredAgents,
+      );
+      const plan = planExecution(
+        intent,
+        { ...context, taskText: currentTurnPrompt },
+        this.deps.personalAI,
+        { hasDirectBackendAgents },
+      );
 
       if (plan.mode === 'direct_llm') {
         this.deps.logger.info(
@@ -791,13 +937,34 @@ export class PersonalAIRuntime {
         return;
       }
 
-      const selected = this.deps.agentSelector?.select({
-        taskText: context.taskText,
-        preferredAgentId: explicitAgentId,
-        multicaEnabled: this.deps.personalAI.multica.enabled,
+      const outcome = this.selectAgentOutcome({
+        taskText: currentTurnPrompt,
+        identity,
+        userRequestedAgentId: intent.requestedAgentId,
         defaultAgentId: plan.agentId,
       });
-      const pickedAgent: AgentProfile | null = selected?.agent ?? null;
+      if (outcome?.unavailable) {
+        const unavailableText = `[知忆] 无法委派任务：${outcome.unavailable.message}。`;
+        capture.text = unavailableText;
+        yield { type: 'text_delta', content: unavailableText };
+        return;
+      }
+      const pickedAgent: AgentProfile | null = outcome?.selected?.agent ?? null;
+      if (!pickedAgent && !this.deps.personalAI.multica.enabled) {
+        this.deps.logger.info(
+          '[personal-ai] mode=direct_llm reason=无可用本地Agent且MULTICA_ENABLED=false，回退直接回答',
+        );
+        yield* this.streamOrdinaryDirectLlm(
+          context,
+          modelName,
+          input.signal,
+          input.usage,
+          capture,
+          input.publicOrigin,
+        );
+        return;
+      }
+
       const prepared = this.prepareExecutionRecord(
         identity,
         plan.title,
@@ -807,7 +974,7 @@ export class PersonalAIRuntime {
         input.timezone,
       );
       this.deps.logger.info(
-        `[personal-ai] mode=${prepared.execution.execution_mode} agent=${prepared.agent?.agent_id ?? 'default'} reason=${selected?.reason ?? plan.reason}`,
+        `[personal-ai] mode=${prepared.execution.execution_mode} agent=${prepared.agent?.agent_id ?? 'default'} reason=${outcome?.selected?.reason ?? plan.reason}`,
       );
 
       yield* this.dispatchPreparedDelegation(
@@ -819,6 +986,7 @@ export class PersonalAIRuntime {
         input.usage,
         capture,
         input.publicOrigin,
+        historyMessages,
       );
     } catch (error) {
       const message: string = error instanceof Error ? error.message : String(error);

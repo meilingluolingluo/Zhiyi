@@ -1,5 +1,5 @@
 /**
- * 业务任务门面：协调 tasks 与 execution_tasks 的生命周期、并发防重、重试与事务级取消。
+ * 业务任务门面：协调 tasks 与 execution_tasks 的生命周期、并发防重、失败分类、重试与事务级事件追踪。
  */
 import { randomUUID } from 'node:crypto';
 import type { AgentStore } from '../../agents';
@@ -16,6 +16,16 @@ import {
   type SubtaskStats,
 } from '../domain/types';
 import type { BusinessTaskRepository } from './business-task-repository';
+import type {
+  ExecutionEventRecord,
+  ExecutionEventStore,
+  NewExecutionEventInput,
+} from './execution-event-store';
+import {
+  classifyExecutionFailure,
+  formatTaskLifecycleSummary,
+  type ExecutionFailureCategory,
+} from './execution-lifecycle';
 import type { ExecutionTask, TaskRepository } from './task-repository';
 
 export interface PrepareExecutionOptions {
@@ -24,6 +34,7 @@ export interface PrepareExecutionOptions {
   inputSummary?: string;
   multicaEnabled: boolean;
   defaultAgentId?: string;
+  forceRetry?: boolean;
 }
 
 export interface PrepareAdhocDelegationOptions {
@@ -56,6 +67,9 @@ export interface BusinessTaskDetail {
   subtasks: BusinessTask[];
   subtask_stats: SubtaskStats;
   latest_execution: ExecutionTask | null;
+  execution_count: number;
+  recent_events: ExecutionEventRecord[];
+  lifecycle_summary: string;
 }
 
 export interface CancelBusinessTaskResult {
@@ -77,7 +91,91 @@ export class BusinessTaskManager {
     private readonly businessRepo: BusinessTaskRepository,
     private readonly taskRepo: TaskRepository,
     private readonly agentStore: AgentStore,
+    private readonly eventStore?: ExecutionEventStore,
+    private readonly onTaskCompleted?: (params: {
+      userId: string;
+      taskId: string;
+      agentId: string | null;
+      result: string;
+    }) => void,
   ) {}
+
+  private validateExecutableAgent(agentId: string, multicaEnabled: boolean): AgentProfile {
+    const agent = this.agentStore.get(agentId);
+    if (!agent) {
+      throw new DomainError(404, 'agent_not_found', `Agent ${agentId} 不存在`);
+    }
+    if (agent.status !== 'active') {
+      throw new DomainError(409, 'agent_disabled', `Agent ${agentId} 已禁用`, 'conflict');
+    }
+    if (agent.execution_backend === 'multica' && !multicaEnabled) {
+      throw new DomainError(
+        503,
+        'multica_disabled',
+        'MultiCA 未启用（MULTICA_ENABLED=false）',
+        'service_unavailable',
+      );
+    }
+    const activeCount: number = this.taskRepo.countActiveByAgent(agent.agent_id);
+    if (activeCount >= agent.concurrency_limit) {
+      throw new DomainError(
+        409,
+        'agent_concurrency_limit',
+        `Agent ${agent.agent_id} 已达到并发上限（${agent.concurrency_limit}）`,
+        'conflict',
+      );
+    }
+    return agent;
+  }
+
+  private recordLifecycleCreationEvents(
+    execution: ExecutionTask,
+    previousExecution?: ExecutionTask,
+  ): void {
+    if (!this.eventStore) return;
+    if (previousExecution) {
+      const switchedAgent =
+        Boolean(execution.agent_id) && execution.agent_id !== previousExecution.agent_id;
+      this.eventStore.record({
+        executionId: execution.id,
+        taskId: execution.task_id,
+        userId: execution.user_id,
+        eventType: 'retried',
+        agentId: execution.agent_id,
+        status: execution.status,
+        message: switchedAgent
+          ? `更换 Agent 为 ${execution.agent_id} 重新执行（前次 ${previousExecution.id}）`
+          : `重试执行（前次 ${previousExecution.id}）`,
+        metadata: {
+          retry_of_execution_id: previousExecution.id,
+          previous_agent_id: previousExecution.agent_id,
+          new_agent_id: execution.agent_id,
+          switched_agent: switchedAgent,
+        },
+      });
+    }
+    this.eventStore.record({
+      executionId: execution.id,
+      taskId: execution.task_id,
+      userId: execution.user_id,
+      eventType: 'created',
+      agentId: execution.agent_id,
+      status: execution.status,
+      message: `创建 Execution（${execution.execution_mode}）`,
+      metadata: { execution_mode: execution.execution_mode },
+    });
+    if (execution.status === 'running') {
+      this.eventStore.record({
+        executionId: execution.id,
+        taskId: execution.task_id,
+        userId: execution.user_id,
+        eventType: 'started',
+        agentId: execution.agent_id,
+        status: 'running',
+        message: `Agent ${execution.agent_id ?? 'default'} 开始执行`,
+      });
+    }
+  }
 
   create(
     userId: string,
@@ -95,12 +193,19 @@ export class BusinessTaskManager {
     const task = this.businessRepo.getActive(userId, taskId);
     if (!task) return undefined;
     const subtasks = this.businessRepo.listSubtasks(userId, taskId);
-    const latestExecution = this.taskRepo.getLatestByTaskId(userId, taskId) ?? null;
+    const execPage = this.taskRepo.listByTaskId(userId, taskId, 1, 0);
+    const latestExecution = execPage.items[0] ?? null;
+    const recentEvents = this.eventStore
+      ? this.eventStore.listByTask(userId, taskId, 30, 0).items
+      : [];
     return {
       task,
       subtasks,
       subtask_stats: this.businessRepo.subtaskStats(subtasks),
       latest_execution: latestExecution,
+      execution_count: execPage.total,
+      recent_events: recentEvents,
+      lifecycle_summary: formatTaskLifecycleSummary(task, latestExecution, execPage.total),
     };
   }
 
@@ -127,9 +232,50 @@ export class BusinessTaskManager {
     return this.taskRepo.listByTaskId(userId, taskId, limit, offset);
   }
 
+  listExecutionEvents(
+    userId: string,
+    taskId: string,
+    limit = 100,
+    offset = 0,
+  ): { items: ExecutionEventRecord[]; total: number } | undefined {
+    const task = this.businessRepo.getActive(userId, taskId);
+    if (!task) return undefined;
+    if (!this.eventStore) return { items: [], total: 0 };
+    return this.eventStore.listByTask(userId, taskId, limit, offset);
+  }
+
+  recordEvent(input: NewExecutionEventInput): ExecutionEventRecord | undefined {
+    return this.eventStore?.record(input);
+  }
+
+  /** 为正在运行的直连/OpenClaw 执行记录心跳进度与事件，避免误判为僵死。 */
+  recordExecutionProgress(
+    executionId: string,
+    message: string,
+    options: { eventType?: 'progress' | 'tool_call'; metadata?: Record<string, unknown> } = {},
+  ): void {
+    const exec = this.taskRepo.getById(executionId);
+    if (!exec) return;
+    const now: string = new Date().toISOString();
+    this.taskRepo.updateIfActive(executionId, {
+      progress_message: message.slice(0, 500),
+      last_progress_at: now,
+    });
+    this.eventStore?.record({
+      executionId,
+      taskId: exec.task_id,
+      userId: exec.user_id,
+      eventType: options.eventType ?? 'progress',
+      agentId: exec.agent_id,
+      status: exec.status,
+      message,
+      metadata: options.metadata,
+    });
+  }
+
   /**
-   * 原子抢占执行权并创建一条新的 execution_tasks 记录（用于首次执行、失败重试或换 Agent 重试）。
-   * 依赖 BEGIN IMMEDIATE 事务 + idx_execution_tasks_one_active_per_task 双重防并发。
+   * 原子抢占执行权并创建独立 execution_tasks 记录（首次执行 / 重试 / 换 Agent 重试）。
+   * 禁止重跑已完成任务；对不可重试失败且未更换 Agent 的调用需显式传入 forceRetry。
    */
   prepareExecution(
     userId: string,
@@ -163,28 +309,20 @@ export class BusinessTaskManager {
         task.assignee_agent_id ||
         options.defaultAgentId ||
         'developer';
+      const agent = this.validateExecutableAgent(targetAgentId, options.multicaEnabled);
 
-      const agent = this.agentStore.get(targetAgentId);
-      if (!agent) {
-        throw new DomainError(404, 'agent_not_found', `Agent ${targetAgentId} 不存在`);
-      }
-      if (agent.status !== 'active') {
-        throw new DomainError(409, 'agent_disabled', `Agent ${targetAgentId} 已禁用`, 'conflict');
-      }
-      if (agent.execution_backend === 'multica' && !options.multicaEnabled) {
-        throw new DomainError(
-          503,
-          'multica_disabled',
-          'MultiCA 未启用（MULTICA_ENABLED=false）',
-          'service_unavailable',
-        );
-      }
-      const activeCount: number = this.taskRepo.countActiveByAgent(agent.agent_id);
-      if (activeCount >= agent.concurrency_limit) {
+      const previousExec = this.taskRepo.getLatestByTaskId(userId, task.id);
+      if (
+        previousExec &&
+        previousExec.status === 'failed' &&
+        !previousExec.retryable &&
+        agent.agent_id === previousExec.agent_id &&
+        !options.forceRetry
+      ) {
         throw new DomainError(
           409,
-          'agent_concurrency_limit',
-          `Agent ${agent.agent_id} 已达到并发上限（${agent.concurrency_limit}）`,
+          'non_retryable_failure',
+          `最近一次执行（${previousExec.id}）属于不可重试失败：${previousExec.error ?? '配置或权限异常'}；请先修正问题、更换其他 Agent 或显式启用强制重试`,
           'conflict',
         );
       }
@@ -201,7 +339,6 @@ export class BusinessTaskManager {
         task_id: task.id,
         user_id: userId,
         conversation_id: options.conversationId ?? `task_conv_${task.id}`,
-        // 每次执行/重试生成独立 request_id，绝不覆盖历史 execution_tasks
         request_id: `exec_${randomUUID()}`,
         agent_id: agent.agent_id,
         project_id: task.project_id,
@@ -209,6 +346,7 @@ export class BusinessTaskManager {
           agent.execution_backend === 'direct_llm' ? 'direct_llm' : 'agent_delegation',
         input_summary: summary,
         initial_status: agent.execution_backend === 'direct_llm' ? 'running' : 'pending',
+        retry_of_execution_id: previousExec?.id ?? null,
       });
       if (!created) {
         throw new DomainError(409, 'execution_create_conflict', '创建 Execution 冲突', 'conflict');
@@ -224,6 +362,8 @@ export class BusinessTaskManager {
         throw new DomainError(409, 'status_conflict', '任务状态已被并发变更', 'conflict');
       }
 
+      this.recordLifecycleCreationEvents(execution, previousExec);
+
       return {
         task: this.businessRepo.getActive(userId, task.id) as BusinessTask,
         execution,
@@ -234,7 +374,6 @@ export class BusinessTaskManager {
 
   /**
    * 供 PersonalAIRuntime 对话路由调用：按 (user_id, request_id) 幂等创建业务 Task 与关联 Execution。
-   * 对不归属当前用户或仅为 V1 兼容占位字符串（非 projects 表记录）的 projectId 自动脱敏为 null。
    */
   prepareAdhocDelegation(options: PrepareAdhocDelegationOptions): PreparedAdhocDelegation {
     return this.db.transaction((): PreparedAdhocDelegation => {
@@ -256,30 +395,7 @@ export class BusinessTaskManager {
 
       let agent: AgentProfile | null = null;
       if (options.agentId && options.agentId.trim() !== '') {
-        const found = this.agentStore.get(options.agentId.trim());
-        if (!found) {
-          throw new DomainError(404, 'agent_not_found', `Agent ${options.agentId} 不存在`);
-        }
-        if (found.status !== 'active') {
-          throw new DomainError(409, 'agent_disabled', `Agent ${found.agent_id} 已禁用`, 'conflict');
-        }
-        if (found.execution_backend === 'multica' && !options.multicaEnabled) {
-          throw new DomainError(
-            503,
-            'multica_disabled',
-            'MultiCA 未启用（MULTICA_ENABLED=false）',
-            'service_unavailable',
-          );
-        }
-        if (this.taskRepo.countActiveByAgent(found.agent_id) >= found.concurrency_limit) {
-          throw new DomainError(
-            409,
-            'agent_concurrency_limit',
-            `Agent ${found.agent_id} 已达到并发上限（${found.concurrency_limit}）`,
-            'conflict',
-          );
-        }
-        agent = found;
+        agent = this.validateExecutableAgent(options.agentId.trim(), options.multicaEnabled);
       }
 
       const validProjectId: string | null =
@@ -328,6 +444,8 @@ export class BusinessTaskManager {
         throw new DomainError(409, 'status_conflict', '任务状态已被并发变更', 'conflict');
       }
 
+      this.recordLifecycleCreationEvents(execution);
+
       return {
         task: this.businessRepo.getActive(options.userId, businessTask.id) as BusinessTask,
         execution,
@@ -337,40 +455,126 @@ export class BusinessTaskManager {
     });
   }
 
-  /** direct_llm 执行完成/失败/取消时，在同事务内更新 execution_tasks 与 tasks。 */
+  /** direct_llm 执行完成/失败/取消时，在同事务内写入分类结果、事件与任务终态。 */
   finishDirectExecution(
     executionId: string,
     outcome:
       | { status: 'completed'; result: string }
-      | { status: 'failed'; error: string }
+      | {
+          status: 'failed';
+          error: string;
+          statusCode?: number;
+          errorCode?: string;
+          categoryOverride?: ExecutionFailureCategory;
+        }
       | { status: 'cancelled'; error?: string },
   ): boolean {
-    return this.db.transaction((): boolean => {
-      const exec = this.taskRepo.getById(executionId);
-      if (!exec) return false;
+    const exec = this.taskRepo.getById(executionId);
+    if (!exec) return false;
+    const applied = this.db.transaction((): boolean => {
+      const current = this.taskRepo.getById(executionId);
+      if (!current) return false;
       const now: string = new Date().toISOString();
-      const applied: boolean =
-        outcome.status === 'completed'
-          ? this.taskRepo.updateIfActive(executionId, {
-              status: 'completed',
-              result: outcome.result,
-              completed_at: now,
-            })
-          : this.taskRepo.updateIfActive(executionId, {
-              status: outcome.status,
-              error: outcome.error ?? (outcome.status === 'cancelled' ? '用户取消任务' : '执行失败'),
-              completed_at: now,
-            });
-      if (applied && exec.task_id) {
-        this.businessRepo.casSyncTerminalInTx(exec.task_id, outcome.status);
+
+      if (outcome.status === 'completed') {
+        const updated = this.taskRepo.updateIfActive(executionId, {
+          status: 'completed',
+          result: outcome.result,
+          error_category: null,
+          error_code: null,
+          retryable: false,
+          needs_verification: false,
+          completed_at: now,
+        });
+        if (updated) {
+          this.eventStore?.record({
+            executionId,
+            taskId: current.task_id,
+            userId: current.user_id,
+            eventType: 'completed',
+            agentId: current.agent_id,
+            status: 'completed',
+            message: '执行成功完成',
+          });
+          if (current.task_id) this.businessRepo.casSyncTerminalInTx(current.task_id, 'completed');
+        }
+        return updated;
       }
-      return applied;
+
+      if (outcome.status === 'cancelled') {
+        const reason = outcome.error ?? '用户取消任务';
+        const updated = this.taskRepo.updateIfActive(executionId, {
+          status: 'cancelled',
+          error: reason,
+          error_category: 'cancelled',
+          error_code: 'cancelled_by_user',
+          retryable: false,
+          needs_verification: false,
+          completed_at: now,
+        });
+        if (updated) {
+          this.eventStore?.record({
+            executionId,
+            taskId: current.task_id,
+            userId: current.user_id,
+            eventType: 'cancelled',
+            agentId: current.agent_id,
+            status: 'cancelled',
+            message: reason,
+          });
+          if (current.task_id) this.businessRepo.casSyncTerminalInTx(current.task_id, 'cancelled');
+        }
+        return updated;
+      }
+
+      const classified = classifyExecutionFailure({
+        message: outcome.error,
+        statusCode: outcome.statusCode,
+        codeOverride: outcome.errorCode,
+        categoryOverride: outcome.categoryOverride,
+      });
+      const updated = this.taskRepo.updateIfActive(executionId, {
+        status: 'failed',
+        error: classified.message,
+        error_category: classified.category,
+        error_code: classified.code,
+        retryable: classified.retryable,
+        needs_verification: classified.needsVerification,
+        completed_at: now,
+      });
+      if (updated) {
+        this.eventStore?.record({
+          executionId,
+          taskId: current.task_id,
+          userId: current.user_id,
+          eventType: classified.needsVerification ? 'verification_required' : 'failed',
+          agentId: current.agent_id,
+          status: 'failed',
+          message: classified.message,
+          metadata: {
+            error_category: classified.category,
+            error_code: classified.code,
+            retryable: classified.retryable,
+            needs_verification: classified.needsVerification,
+          },
+        });
+        if (current.task_id) this.businessRepo.casSyncTerminalInTx(current.task_id, 'failed');
+      }
+      return updated;
     });
+
+    if (applied && outcome.status === 'completed' && exec.task_id) {
+      this.onTaskCompleted?.({
+        userId: exec.user_id,
+        taskId: exec.task_id,
+        agentId: exec.agent_id,
+        result: outcome.result,
+      });
+    }
+    return applied;
   }
 
-  /**
-   * 原子取消业务 Task 与所有关联活跃 Execution（外部载体中止由调用方在事务外尽力执行）。
-   */
+  /** 原子取消业务 Task 与所有关联活跃 Execution，并同步记录 cancelled 事件。 */
   cancelTask(userId: string, taskId: string): CancelBusinessTaskResult {
     return this.db.transaction((): CancelBusinessTaskResult => {
       const task = this.businessRepo.getActive(userId, taskId);
@@ -393,9 +597,22 @@ export class BusinessTaskManager {
         const applied: boolean = this.taskRepo.updateIfActive(exec.id, {
           status: 'cancelled',
           error: '用户取消任务',
+          error_category: 'cancelled',
+          error_code: 'cancelled_by_user',
+          retryable: false,
+          needs_verification: false,
           completed_at: now,
         });
         if (applied) {
+          this.eventStore?.record({
+            executionId: exec.id,
+            taskId: exec.task_id,
+            userId,
+            eventType: 'cancelled',
+            agentId: exec.agent_id,
+            status: 'cancelled',
+            message: '用户取消任务',
+          });
           cancelledExecs.push(this.taskRepo.getById(exec.id) ?? exec);
         }
       }
@@ -413,7 +630,7 @@ export class BusinessTaskManager {
   }
 
   /** 供 TaskWorker 终态回写同事务调用。 */
-  onExecutionTerminalInTx(taskId: string, status: 'completed' | 'failed'): void {
+  onExecutionTerminalInTx(taskId: string, status: 'completed' | 'failed' | 'cancelled'): void {
     this.businessRepo.casSyncTerminalInTx(taskId, status);
   }
 

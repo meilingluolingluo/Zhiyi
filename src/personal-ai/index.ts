@@ -12,6 +12,10 @@ import { ConversationContextStore } from './conversation/conversation-context';
 import { GoalStore } from './domain/goal-store';
 import { ProjectStore } from './domain/project-store';
 import { UserProfileStore } from './domain/user-profile-store';
+import { recordTaskCompletionCandidate } from './domain/work-operations';
+import { ProactiveEngine } from './proactive/proactive-engine';
+import { ProactiveScheduler } from './proactive/proactive-scheduler';
+import { ProactiveStore } from './proactive/proactive-store';
 import { createPersonalAIDomainRouter } from './routes-domain';
 import { AgentSelector } from './runtime/agent-selector';
 import { DirectExecutionRunner } from './runtime/direct-execution-runner';
@@ -22,6 +26,7 @@ import { createPersonalAIRouter } from './routes';
 import { executeImageGeneration } from '../upstream/media-handlers';
 import { BusinessTaskManager } from './task/business-task-manager';
 import { BusinessTaskRepository } from './task/business-task-repository';
+import { ExecutionEventStore } from './task/execution-event-store';
 import { TaskManager } from './task/task-manager';
 import { TaskRepository } from './task/task-repository';
 import { TaskWorker } from './worker/task-worker';
@@ -33,6 +38,10 @@ export interface PersonalAIAssembly {
   adapter: AgentExecutionAdapter | null;
   runtime: PersonalAIRuntime;
   taskManager: TaskManager;
+  executionEventStore: ExecutionEventStore;
+  proactiveStore: ProactiveStore;
+  proactiveEngine: ProactiveEngine;
+  proactiveScheduler: ProactiveScheduler;
   userProfiles: UserProfileStore;
   goalStore: GoalStore;
   projectStore: ProjectStore;
@@ -56,6 +65,7 @@ export function createPersonalAI(
           llmIntentEnabled: process.env.PHASE1_LLM_INTENT_ENABLED === 'true',
         };
   const repo: TaskRepository = new TaskRepository(base.db);
+  const executionEventStore: ExecutionEventStore = new ExecutionEventStore(base.db);
   const userProfiles: UserProfileStore = new UserProfileStore(base.db);
   const goalStore: GoalStore = new GoalStore(base.db, userProfiles);
   const projectStore: ProjectStore = new ProjectStore(base.db, userProfiles);
@@ -64,15 +74,38 @@ export function createPersonalAI(
     userProfiles,
     repo,
   );
+  const onTaskCompleted = (params: {
+    userId: string;
+    taskId: string;
+    agentId: string | null;
+    result: string;
+  }): void => {
+    recordTaskCompletionCandidate(
+      {
+        businessTaskManager,
+        projectStore,
+        candidateStore: base.candidateStore,
+        memoryStore: base.memoryStore,
+      },
+      params,
+    );
+  };
+
   const businessTaskManager: BusinessTaskManager = new BusinessTaskManager(
     base.db,
     businessRepo,
     repo,
     base.agentStore,
+    executionEventStore,
+    onTaskCompleted,
   );
-  const taskManager: TaskManager = new TaskManager(repo, (taskId: string): void => {
-    businessTaskManager.onExecutionCancelledInTx(taskId);
-  });
+  const taskManager: TaskManager = new TaskManager(
+    repo,
+    (taskId: string): void => {
+      businessTaskManager.onExecutionCancelledInTx(taskId);
+    },
+    executionEventStore,
+  );
   const conversationStore: ConversationContextStore = new ConversationContextStore(base.db);
 
   const adapter: AgentExecutionAdapter | null = config.multica.enabled
@@ -90,12 +123,17 @@ export function createPersonalAI(
     adapter,
     logger: base.logger,
     agentStore: base.agentStore,
-    onExecutionTerminalInTx: (taskId: string, status: 'completed' | 'failed'): void => {
+    eventStore: executionEventStore,
+    onExecutionTerminalInTx: (
+      taskId: string,
+      status: 'completed' | 'failed' | 'cancelled',
+    ): void => {
       businessTaskManager.onExecutionTerminalInTx(taskId, status);
     },
     onStartupRecoverInTx: (): void => {
       businessTaskManager.reconcileOrphanedInProgressInTx();
     },
+    onTaskCompleted,
   });
 
   const modelAdapter: ModelAdapter = new ModelAdapter({
@@ -115,10 +153,31 @@ export function createPersonalAI(
     logger: base.logger,
   });
 
+  const proactiveStore: ProactiveStore = new ProactiveStore(base.db);
+  const proactiveEngine: ProactiveEngine = new ProactiveEngine({
+    userProfiles,
+    goalStore,
+    projectStore,
+    businessTaskManager,
+    taskRepo: repo,
+    proactiveStore,
+    candidateStore: base.candidateStore,
+  });
+  const proactiveScheduler: ProactiveScheduler = new ProactiveScheduler({
+    store: proactiveStore,
+    engine: proactiveEngine,
+    logger: base.logger,
+  });
+
   const toolGateway: ZhiyiToolGateway = new ZhiyiToolGateway({
     memoryStore: base.memoryStore,
+    candidateStore: base.candidateStore,
     businessTaskManager,
     goalStore,
+    projectStore,
+    agentStore: base.agentStore,
+    taskRepo: repo,
+    proactiveStore,
     logger: base.logger,
     generateImages: (body, options) =>
       executeImageGeneration(
@@ -164,6 +223,7 @@ export function createPersonalAI(
     goalStore,
     projectStore,
     businessTaskManager,
+    proactiveStore,
     agentSelector,
     directRunner,
     openClawRunner,
@@ -190,11 +250,15 @@ export function createPersonalAI(
       appConfig: base.config,
       agentStore: base.agentStore,
       memoryStore: base.memoryStore,
+      candidateStore: base.candidateStore,
       userProfiles,
       goalStore,
       projectStore,
       businessTaskManager,
       taskManager,
+      taskRepo: repo,
+      proactiveStore,
+      proactiveEngine,
       worker,
       adapter,
       directRunner,
@@ -203,6 +267,7 @@ export function createPersonalAI(
   );
 
   worker.start();
+  proactiveScheduler.start();
   return {
     router,
     worker,
@@ -210,6 +275,10 @@ export function createPersonalAI(
     adapter,
     runtime,
     taskManager,
+    executionEventStore,
+    proactiveStore,
+    proactiveEngine,
+    proactiveScheduler,
     userProfiles,
     goalStore,
     projectStore,

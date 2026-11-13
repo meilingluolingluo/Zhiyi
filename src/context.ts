@@ -116,9 +116,16 @@ export function buildMemoryContext(params: ContextParams): ContextResult {
   const selected: SearchHit[] = [];
   let usedChars: number = header.length + footer.length + 4;
 
+function formatMemoryLine(hit: SearchHit): string {
+  const m = hit.memory;
+  const trustLabel = m.verified_by_user ? '已确认' : '推断参考';
+  const updatedDate = m.updated_at ? m.updated_at.slice(0, 10) : '';
+  return `- [${m.scope}/${m.category}/${m.type}，${trustLabel}，置信度 ${Number(m.confidence).toFixed(2)}，来源 ${m.source}${updatedDate ? `，更新 ${updatedDate}` : ''}] ${m.content}`;
+}
+
   for (const hit of ranked.slice(0, maxItems * 3)) {
     if (selected.length >= maxItems) break;
-    const line: string = `- [${hit.memory.scope}/${hit.memory.type}，置信度 ${Number(hit.memory.confidence).toFixed(2)}，来源 ${hit.memory.source}] ${hit.memory.content}`;
+    const line: string = formatMemoryLine(hit);
     if (usedChars + line.length > charBudget && selected.length > 0) break;
     if (usedChars + line.length > charBudget && selected.length === 0) {
       const remain: number = Math.max(40, charBudget - usedChars - 20);
@@ -134,9 +141,7 @@ export function buildMemoryContext(params: ContextParams): ContextResult {
 
   if (selected.length === 0) return empty;
 
-  const lines: string[] = selected.map((hit: SearchHit): string =>
-    `- [${hit.memory.scope}/${hit.memory.type}，置信度 ${Number(hit.memory.confidence).toFixed(2)}，来源 ${hit.memory.source}] ${hit.memory.content}`,
-  );
+  const lines: string[] = selected.map(formatMemoryLine);
   const systemMessage: string = [header, ...lines, footer].join('\n');
   return { injected: true, systemMessage, hits: selected, query };
 }

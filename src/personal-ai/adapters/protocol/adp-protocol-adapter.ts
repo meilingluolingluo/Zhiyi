@@ -136,6 +136,12 @@ function v2EndFrames(ctx: ProtocolContext): string[] {
 export function progressText(event: PersonalAIEvent): string | null {
   switch (event.type) {
     case 'task_started':
+      if (event.mode === 'openclaw') {
+        return `\n[知忆] 任务 ${event.taskId} 已交由进程内 Agent ${event.agentId ?? 'openclaw'} 开始执行。\n`;
+      }
+      if (event.mode === 'direct_llm') {
+        return `\n[知忆] 任务 ${event.taskId} 已创建，交由 Agent ${event.agentId ?? 'direct_llm'} 执行。\n`;
+      }
       return `\n[知忆] 任务 ${event.taskId} 已提交至 MultiCA，等待本地 daemon 领取。\n`;
     case 'task_progress':
       return `\n[知忆] 任务进度 ${event.status}${event.message ? `：${event.message}` : ''}\n`;
@@ -145,6 +151,8 @@ export function progressText(event: PersonalAIEvent): string | null {
       return `\n[知忆] Agent ${event.agentId} 执行完成，正在整理结果。\n`;
     case 'task_failed':
       return `\n[知忆] 任务失败：${event.error}\n`;
+    case 'task_cancelled':
+      return `\n[知忆] 任务 ${event.taskId} 已取消${event.reason ? `：${event.reason}` : ''}。\n`;
     default:
       return null;
   }

@@ -7,11 +7,12 @@
 export type PersonalAIEvent =
   | { type: 'message_start'; conversationId: string }
   | { type: 'text_delta'; content: string }
-  | { type: 'task_started'; taskId: string }
+  | { type: 'task_started'; taskId: string; mode?: 'multica' | 'openclaw' | 'direct_llm'; agentId?: string }
   | { type: 'task_progress'; taskId: string; status: string; message?: string }
   | { type: 'agent_started'; taskId: string; agentId: string }
   | { type: 'agent_completed'; taskId: string; agentId: string }
   | { type: 'task_failed'; taskId: string; error: string }
+  | { type: 'task_cancelled'; taskId: string; reason?: string }
   | { type: 'final_answer'; content: string }
   | { type: 'error'; message: string }
   | { type: 'message_end' };
@@ -24,6 +25,7 @@ export const PERSONAL_AI_EVENT_TYPES: readonly PersonalAIEvent['type'][] = [
   'agent_started',
   'agent_completed',
   'task_failed',
+  'task_cancelled',
   'final_answer',
   'error',
   'message_end',

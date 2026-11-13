@@ -11,22 +11,26 @@ import express, {
   type Router,
 } from 'express';
 import type { AgentStore } from '../agents';
+import type { CandidateStore } from '../candidates';
 import type { AppConfig } from '../config';
 import type { Database } from '../db';
 import { errorBody } from '../errors';
 import type { MemoryStore } from '../memories';
+import { updateProjectForUser } from './domain/work-operations';
 import type { AgentExecutionAdapter } from './adapters/agent/agent-adapter';
 import type { PersonalAIConfig } from './config';
 import type { GoalStore } from './domain/goal-store';
 import type { ProjectStore } from './domain/project-store';
 import {
   DomainError,
+  PROACTIVE_NOTIFICATION_KINDS,
   type GoalFilters,
   type GoalPatch,
   type GoalStatus,
   type NewBusinessTaskInput,
   type NewGoalInput,
   type NewProjectInput,
+  type ProactiveNotificationKind,
   type ProjectFilters,
   type ProjectPatch,
   type ProjectStatus,
@@ -41,12 +45,19 @@ import {
   type HeaderBag,
   type PersonalAIIdentity,
 } from './identity/identity-manager';
+import { buildProjectProgressSummary } from './proactive/project-summary';
+import type { ProactiveEngine } from './proactive/proactive-engine';
+import type {
+  ProactiveNotificationStatus,
+  ProactiveStore,
+} from './proactive/proactive-store';
 import { buildPersonalAIContext } from './runtime/context-builder';
 import type { DirectExecutionRunner } from './runtime/direct-execution-runner';
 import type { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
 import { isOpenClawAgent } from './runtime/openclaw/types';
 import type { BusinessTaskManager } from './task/business-task-manager';
 import type { TaskManager } from './task/task-manager';
+import type { TaskRepository } from './task/task-repository';
 import type { TaskWorker } from './worker/task-worker';
 
 export interface DomainRouterDeps {
@@ -55,11 +66,15 @@ export interface DomainRouterDeps {
   appConfig?: AppConfig;
   agentStore?: AgentStore;
   memoryStore?: MemoryStore;
+  candidateStore?: CandidateStore;
   userProfiles: UserProfileStore;
   goalStore: GoalStore;
   projectStore: ProjectStore;
   businessTaskManager: BusinessTaskManager;
   taskManager: TaskManager;
+  taskRepo?: TaskRepository;
+  proactiveStore?: ProactiveStore;
+  proactiveEngine?: ProactiveEngine;
   worker: TaskWorker;
   adapter: AgentExecutionAdapter | null;
   directRunner: DirectExecutionRunner;
@@ -382,15 +397,17 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
       return;
     }
     try {
-      const project = deps.projectStore.update(
+      const project = updateProjectForUser(
+        {
+          projectStore: deps.projectStore,
+          businessTaskManager: deps.businessTaskManager,
+          candidateStore: deps.candidateStore,
+          memoryStore: deps.memoryStore,
+        },
         identity.user_id,
         req.params.id,
         req.body as ProjectPatch,
       );
-      if (!project) {
-        res.status(404).json(errorBody('Project 不存在或无权访问', 'not_found'));
-        return;
-      }
       res.json({ project });
     } catch (error) {
       handleDomainError(res, error);
@@ -504,7 +521,10 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
     }
   });
 
-  router.post('/v1/personal-ai/work-tasks/:id/execute', async (req, res): Promise<void> => {
+  async function handleExecuteOrRetry(
+    req: ExpressRequest,
+    res: ExpressResponse,
+  ): Promise<void> {
     const identity = requireIdentity(req, res, deps.config);
     if (!identity) return;
     const body = bodyOf(req);
@@ -512,6 +532,7 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
       typeof body.agent_id === 'string' && body.agent_id.trim() !== ''
         ? body.agent_id.trim()
         : undefined;
+    const forceRetry: boolean = body.force_retry === true;
 
     try {
       const prepared = deps.businessTaskManager.prepareExecution(
@@ -522,6 +543,7 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
           conversationId: identity.conversation_id,
           multicaEnabled: deps.config.multica.enabled,
           defaultAgentId: 'developer',
+          forceRetry,
         },
       );
 
@@ -580,7 +602,10 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
     } catch (error) {
       handleDomainError(res, error);
     }
-  });
+  }
+
+  router.post('/v1/personal-ai/work-tasks/:id/execute', handleExecuteOrRetry);
+  router.post('/v1/personal-ai/work-tasks/:id/retry', handleExecuteOrRetry);
 
   router.get('/v1/personal-ai/work-tasks/:id/executions', (req, res): void => {
     const identity = requireIdentity(req, res, deps.config);
@@ -588,6 +613,24 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
     const limit: number = queryInt(req.query.limit, 50);
     const offset: number = queryInt(req.query.offset, 0);
     const page = deps.businessTaskManager.listExecutions(
+      identity.user_id,
+      req.params.id,
+      limit,
+      offset,
+    );
+    if (!page) {
+      res.status(404).json(errorBody('业务任务不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ ...page, limit: Math.min(Math.max(limit, 1), 200), offset });
+  });
+
+  router.get('/v1/personal-ai/work-tasks/:id/events', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const limit: number = queryInt(req.query.limit, 100);
+    const offset: number = queryInt(req.query.offset, 0);
+    const page = deps.businessTaskManager.listExecutionEvents(
       identity.user_id,
       req.params.id,
       limit,
@@ -627,6 +670,140 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
     } catch (error) {
       handleDomainError(res, error);
     }
+  });
+
+  // ===== 项目进度真实汇总与主动提醒收件箱 =====
+  router.get('/v1/personal-ai/projects/:id/summary', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!deps.taskRepo) {
+      res.status(503).json(errorBody('TaskRepository 未配置', 'service_unavailable'));
+      return;
+    }
+    const summary = buildProjectProgressSummary(
+      {
+        projectStore: deps.projectStore,
+        businessTaskManager: deps.businessTaskManager,
+        taskRepo: deps.taskRepo,
+      },
+      identity.user_id,
+      req.params.id,
+    );
+    if (!summary) {
+      res.status(404).json(errorBody('Project 不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json(summary);
+  });
+
+  router.get('/v1/personal-ai/proactive/notifications', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!deps.proactiveStore) {
+      res.json({ items: [], total: 0, unread_count: 0, limit: 50, offset: 0 });
+      return;
+    }
+    const rawStatus = queryString(req.query.status);
+    const status: ProactiveNotificationStatus | 'all' =
+      rawStatus === 'unread' || rawStatus === 'read' || rawStatus === 'dismissed'
+        ? rawStatus
+        : 'all';
+    const rawKind = queryString(req.query.kind);
+    const kind =
+      rawKind && PROACTIVE_NOTIFICATION_KINDS.includes(rawKind as ProactiveNotificationKind)
+        ? (rawKind as ProactiveNotificationKind)
+        : undefined;
+    const limit = queryInt(req.query.limit, 50);
+    const offset = queryInt(req.query.offset, 0);
+    res.json(deps.proactiveStore.list(identity.user_id, { status, kind, limit, offset }));
+  });
+
+  router.post('/v1/personal-ai/proactive/notifications/:id/read', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!deps.proactiveStore) {
+      res.status(404).json(errorBody('主动提醒功能未启用', 'not_found'));
+      return;
+    }
+    const updated = deps.proactiveStore.markRead(identity.user_id, req.params.id);
+    if (!updated) {
+      res.status(404).json(errorBody('主动提醒不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ notification: updated });
+  });
+
+  router.post('/v1/personal-ai/proactive/notifications/:id/dismiss', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!deps.proactiveStore) {
+      res.status(404).json(errorBody('主动提醒功能未启用', 'not_found'));
+      return;
+    }
+    const updated = deps.proactiveStore.dismiss(identity.user_id, req.params.id);
+    if (!updated) {
+      res.status(404).json(errorBody('主动提醒不存在或无权访问', 'not_found'));
+      return;
+    }
+    res.json({ notification: updated });
+  });
+
+  router.get('/v1/personal-ai/proactive/status', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const profile = deps.userProfiles.ensureUser(identity.user_id, {
+      headerTimezone: headerText(req, 'x-timezone'),
+    });
+    const schedule = deps.proactiveStore?.getScheduleState(identity.user_id) ?? null;
+    const unreadCount =
+      deps.proactiveStore?.list(identity.user_id, { status: 'unread', limit: 1 }).unread_count ?? 0;
+    res.json({
+      proactive_enabled: profile.preferences.proactive_enabled !== false,
+      preferences: {
+        proactive_enabled: profile.preferences.proactive_enabled ?? true,
+        proactive_frequency: profile.preferences.proactive_frequency ?? 'balanced',
+        proactive_types: profile.preferences.proactive_types ?? null,
+        proactive_quiet_hours: profile.preferences.proactive_quiet_hours ?? null,
+        proactive_paused_until: profile.preferences.proactive_paused_until ?? null,
+      },
+      timezone: profile.timezone,
+      schedule,
+      unread_count: unreadCount,
+    });
+  });
+
+  router.patch('/v1/personal-ai/proactive/preferences', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!isPlainObjectBody(req)) {
+      res.status(400).json(errorBody('请求体必须为 JSON 对象', 'bad_request'));
+      return;
+    }
+    try {
+      const profile = deps.userProfiles.update(
+        identity.user_id,
+        { preferences: req.body },
+        { headerTimezone: headerText(req, 'x-timezone') },
+      );
+      res.json({ profile });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.post('/v1/personal-ai/proactive/run', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    if (!deps.proactiveEngine) {
+      res.status(503).json(errorBody('ProactiveEngine 未配置', 'service_unavailable'));
+      return;
+    }
+    const body = bodyOf(req);
+    const outcome = deps.proactiveEngine.evaluateUser(identity.user_id, {
+      respectCooldown: body.respect_cooldown === true,
+      ignoreQuietHours: body.ignore_quiet_hours === true,
+    });
+    res.json(outcome);
   });
 
   return router;

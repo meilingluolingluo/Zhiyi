@@ -4,7 +4,7 @@
 import type { TSchema } from 'typebox';
 import type { AppConfig } from '../../../config';
 import type { Logger } from '../../../logger';
-import type { AgentProfile } from '../../../types';
+import type { AgentProfile, ChatMessage } from '../../../types';
 import type { ModelAdapter, TokenUsage } from '../../adapters/model/model-adapter';
 import type { BusinessTask } from '../../domain/types';
 import type { PersonalAIIdentity } from '../../identity/identity-manager';
@@ -63,6 +63,8 @@ export interface OpenClawRunOptions {
   maxContextTokens?: number;
   /** 可选公共访问前缀（供生图工具返回可浏览器访问的图片链接）。 */
   publicOrigin?: string;
+  /** 可选会话历史消息（最后一条 user 之前的历史轮次，用于多轮连续工具推理）。 */
+  historyMessages?: ChatMessage[];
 }
 
 export interface OpenClawAgentRunnerDeps {

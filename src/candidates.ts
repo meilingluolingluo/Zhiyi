@@ -1,8 +1,13 @@
-/** 候选记忆：自动提取产物，必须 approve 才会进入正式记忆库。 */
+/** 候选记忆：自动提取与工作复盘产物，按用户审批或可信合并策略进入正式记忆库。 */
 import { randomUUID } from 'node:crypto';
 import { Database } from './db';
 import { normalizeContent } from './extraction-rules';
-import type { MemoryStore } from './memories';
+import { normalizeMemoryCategory, type MemoryStore } from './memories';
+import {
+  evolveMemoryWriteInTx,
+  findConflictingMemory,
+  isDuplicateContent,
+} from './memory-evolution';
 import {
   MEMORY_SCOPES,
   MEMORY_TYPES,
@@ -10,6 +15,7 @@ import {
   type ExtractedCandidate,
   type Memory,
   type MemoryCandidate,
+  type MemoryCategory,
   type MemoryScope,
   type MemoryType,
 } from './types';
@@ -18,8 +24,11 @@ export interface NewCandidate {
   user_id: string;
   agent_id?: string | null;
   project_id?: string | null;
+  goal_id?: string | null;
+  task_id?: string | null;
   type: MemoryType;
   scope: MemoryScope;
+  category?: MemoryCategory;
   content: string;
   source?: string;
   trajectory_id?: string | null;
@@ -59,7 +68,11 @@ function rowToCandidate(row: MemoryCandidate): MemoryCandidate {
     ...row,
     agent_id: row.agent_id ?? null,
     project_id: row.project_id ?? null,
+    goal_id: row.goal_id ?? null,
+    task_id: row.task_id ?? null,
+    category: normalizeMemoryCategory(row.category),
     trajectory_id: row.trajectory_id ?? null,
+    conflict_memory_id: row.conflict_memory_id ?? null,
     created_memory_id: row.created_memory_id ?? null,
     confidence: Number(row.confidence),
   };
@@ -73,15 +86,14 @@ export class CandidateStore {
   }
 
   /**
-   * 去重：与已有正式记忆、待处理/已通过候选比较归一化文本（相同 or 互相包含）。
+   * 去重：与已有活跃正式记忆、待处理/已通过候选比较语义重复。
    */
   hasSimilar(userId: string, content: string, memoryStore: MemoryStore): boolean {
     const key: string = normalizeContent(content);
     if (key.length === 0) return true;
-    const memories: Memory[] = memoryStore.allForUser(userId);
+    const memories: Memory[] = memoryStore.allForUser(userId, false);
     for (const memory of memories) {
-      const other: string = normalizeContent(memory.content);
-      if (other && (other === key || other.includes(key) || key.includes(other))) return true;
+      if (isDuplicateContent(content, memory.content)) return true;
     }
     const rows: MemoryCandidate[] = this.db.all<MemoryCandidate>(
       `SELECT * FROM memory_candidates
@@ -89,8 +101,7 @@ export class CandidateStore {
       [userId],
     );
     for (const row of rows) {
-      const other: string = normalizeContent(row.content);
-      if (other && (other === key || other.includes(key) || key.includes(other))) return true;
+      if (isDuplicateContent(content, row.content)) return true;
     }
     return false;
   }
@@ -100,16 +111,32 @@ export class CandidateStore {
       return { created: false };
     }
     const now: string = new Date().toISOString();
+    const scope = normalizeScope(input.scope);
+    const category = normalizeMemoryCategory(input.category);
+    const conflict = findConflictingMemory(
+      input.content,
+      {
+        scope,
+        agent_id: input.agent_id ?? null,
+        project_id: input.project_id ?? null,
+        category,
+      },
+      memoryStore.allForUser(input.user_id, false),
+    );
     const candidate: MemoryCandidate = {
       id: `cand_${randomUUID()}`,
       user_id: input.user_id,
       agent_id: input.agent_id ?? null,
       project_id: input.project_id ?? null,
+      goal_id: input.goal_id ?? null,
+      task_id: input.task_id ?? null,
       type: normalizeType(input.type),
-      scope: normalizeScope(input.scope),
+      scope,
+      category,
       content: input.content,
       source: input.source ?? 'auto-extract',
       trajectory_id: input.trajectory_id ?? null,
+      conflict_memory_id: conflict?.memory.memory_id ?? null,
       confidence: Math.min(1, Math.max(0, Number(input.confidence) || 0)),
       status: input.status ?? 'pending',
       created_memory_id: null,
@@ -118,19 +145,23 @@ export class CandidateStore {
     };
     this.db.run(
       `INSERT INTO memory_candidates
-       (id, user_id, agent_id, project_id, type, scope, content, source,
-        trajectory_id, confidence, status, created_memory_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+       (id, user_id, agent_id, project_id, goal_id, task_id, type, scope, category, content, source,
+        trajectory_id, conflict_memory_id, confidence, status, created_memory_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
       [
         candidate.id,
         candidate.user_id,
         candidate.agent_id,
         candidate.project_id,
+        candidate.goal_id,
+        candidate.task_id,
         candidate.type,
         candidate.scope,
+        candidate.category,
         candidate.content,
         candidate.source,
         candidate.trajectory_id,
+        candidate.conflict_memory_id,
         candidate.confidence,
         candidate.status,
         candidate.created_at,
@@ -166,7 +197,9 @@ export class CandidateStore {
       .map(rowToCandidate);
   }
 
-  /** 幂等 approve：已通过的候选直接返回结果，不会重复写入正式记忆。 */
+  /**
+   * 幂等审批入库：用户审批通过后标记 verified_by_user=true，并在同事务内处理去重合并与冲突替代。
+   */
   approve(userId: string, id: string, memoryStore: MemoryStore): ApproveResult {
     return this.db.transaction((): ApproveResult => {
       const candidate: MemoryCandidate | undefined = this.get(userId, id);
@@ -180,16 +213,31 @@ export class CandidateStore {
       if (candidate.status === 'rejected') {
         return { ok: false, idempotent: false, reason: 'rejected', candidate };
       }
-      const memory: Memory = memoryStore.create({
-        user_id: userId,
-        agent_id: candidate.agent_id,
-        project_id: candidate.project_id,
-        type: candidate.type,
-        scope: candidate.scope,
-        content: candidate.content,
-        source: `candidate:${candidate.id}`,
-        confidence: candidate.confidence,
-      } satisfies Parameters<MemoryStore['create']>[0]);
+
+      const evolved = evolveMemoryWriteInTx(
+        memoryStore,
+        {
+          user_id: userId,
+          agent_id: candidate.agent_id,
+          project_id: candidate.project_id,
+          goal_id: candidate.goal_id,
+          task_id: candidate.task_id,
+          type: candidate.type,
+          scope: candidate.scope,
+          category: candidate.category,
+          content: candidate.content,
+          source: `candidate:${candidate.id}`,
+          confidence: candidate.confidence,
+          verified_by_user: true,
+        },
+        { actor: 'user', supersedeConflicts: true },
+      );
+
+      if (evolved.action === 'conflict_blocked') {
+        return { ok: false, idempotent: false, reason: 'conflict_blocked', candidate };
+      }
+
+      const memory = evolved.memory;
       this.db.run(
         `UPDATE memory_candidates
          SET status = 'approved', created_memory_id = ?, updated_at = ?
@@ -216,13 +264,15 @@ export class CandidateStore {
     return this.get(userId, id);
   }
 
-  /** 把模型/规则产出的候选批量落库，返回新建数量。 */
+  /** 把模型/规则/任务复盘产出的候选批量落库，返回新建数量。 */
   createFromExtraction(
     items: ExtractedCandidate[],
     context: {
       user_id: string;
       agent_id: string | null;
       project_id: string | null;
+      goal_id?: string | null;
+      task_id?: string | null;
       trajectory_id: string | null;
       source: string;
       minConfidence: number;
@@ -238,9 +288,12 @@ export class CandidateStore {
         {
           user_id: context.user_id,
           agent_id: context.agent_id,
-          project_id: item.scope === 'project' ? context.project_id : null,
+          project_id: context.project_id ?? null,
+          goal_id: context.goal_id ?? null,
+          task_id: context.task_id ?? null,
           type: normalizeType(item.type),
           scope: normalizeScope(item.scope),
+          category: normalizeMemoryCategory(item.category),
           content: item.content.trim(),
           source: context.source,
           trajectory_id: context.trajectory_id,

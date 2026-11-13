@@ -22,10 +22,13 @@ import type {
 } from './types';
 
 const EXTRACT_SYSTEM_PROMPT = [
-  '你是记忆抽取器。请从对话中识别具有长期价值的信息：用户偏好、项目背景、重要技术决策、稳定事实、可复用经验方法。',
-  '规则：明显无价值的普通闲聊不保存；无法确定时不要编造；重复内容合并；每条必须能追溯到原对话。',
-  '只返回 JSON 对象，格式为 {"memories":[{"type":"semantic","scope":"personal","content":"原文摘录","confidence":0.8,"reason":"原因"}]}。',
-  'type 取值 identity|episodic|semantic|procedural|working；scope 取值 personal|agent|project|organization。',
+  '你是记忆抽取器。请从对话中识别具有长期价值的信息：用户偏好、稳定个人属性、常用技术/工具、长期目标、项目关键决策、已验证工作经验。',
+  '规则：',
+  '1. 普通闲聊、一次性临时安排（如“今天先这样/临时试一下”）或纯提问不要保存。',
+  '2. 无法确定或模型自身猜测的内容不要冒充用户事实。',
+  '3. 重复内容合并，只输出有明确依据的条目。',
+  '只返回 JSON 对象，格式为 {"memories":[{"type":"semantic","scope":"personal","category":"preference","content":"原文摘录","confidence":0.8,"reason":"原因"}]}。',
+  'type 取值 identity|episodic|semantic|procedural|working；scope 取值 personal|agent|project|organization；category 取值 profile_fact|preference|goal|project_fact|experience|event。',
 ].join('\n');
 
 export interface ExtractionJob {
@@ -33,6 +36,8 @@ export interface ExtractionJob {
   messages: ChatMessage[];
   assistantText: string;
   source: string;
+  goal_id?: string | null;
+  task_id?: string | null;
 }
 
 export interface ExtractionDeps {
@@ -79,6 +84,7 @@ function sanitize(items: unknown): ExtractedCandidate[] {
     result.push({
       type: (typeof item.type === 'string' ? item.type : 'semantic') as ExtractedCandidate['type'],
       scope: (typeof item.scope === 'string' ? item.scope : 'personal') as ExtractedCandidate['scope'],
+      category: (typeof item.category === 'string' ? item.category : 'general') as ExtractedCandidate['category'],
       content: item.content.trim(),
       confidence: Math.min(1, Math.max(0, confidence)),
       reason: typeof item.reason === 'string' ? item.reason : 'model-extract',
@@ -219,6 +225,8 @@ export class ExtractionQueue {
         user_id: job.trajectory.user_id,
         agent_id: job.trajectory.agent_id,
         project_id: job.trajectory.project_id,
+        goal_id: job.goal_id ?? null,
+        task_id: job.task_id ?? job.trajectory.task_id,
         trajectory_id: job.trajectory.id,
         source: job.source,
         minConfidence: this.deps.config.extractMinConfidence,

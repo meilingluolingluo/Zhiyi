@@ -1,23 +1,33 @@
 /**
- * 后台任务 Worker：不依赖 HTTP 请求生命周期。
+ * 后台任务 Worker：不依赖 HTTP 请求生命周期，负责 MultiCA 等外部 Execution 的派发、轮询、恢复与僵死对账。
  *
- * - 服务启动时 recover() 恢复未完成（上一进程遗留 dispatching）任务，
- *   清理遗留 direct_llm 流式执行，并对账孤儿 in_progress 业务任务；
- * - 定时轮询 active 任务，并发受 MULTICA_MAX_CONCURRENT_TASKS 限制；
- * - 失败任务有限重试（依靠 maxPolls 上限），不无限循环；
- * - 终态写入与业务 Task 状态同步置于同一事务，消除写后崩溃分裂窗口；
- * - 完成后停止轮询；任务状态全部持久化。
+ * - 启动时按安全边界恢复遗留 dispatching 任务（已建外部单则直接恢复轮询，不重复建单）、
+ *   把重启中断的 direct_llm 执行收敛为 failed + needs_verification（绝不假定成功），并对账孤儿业务任务；
+ * - 定时检测长时间无进展的外部执行（stalled）与轮询超限，标记为需核实；
+ * - 终态写入、事件记录与业务 Task 状态同步置于同一事务，消除写后崩溃分裂窗口。
  */
 import type { AgentStore } from '../../agents';
 import type { Logger } from '../../logger';
 import type { AgentExecutionAdapter } from '../adapters/agent/agent-adapter';
-import { mapExternalStatus } from '../adapters/agent/multica-adapter';
+import { mapExternalStatus, MultiCAError } from '../adapters/agent/multica-adapter';
 import type { ExecutionStatus, MulticaConfig, PersonalAIConfig } from '../config';
+import type { ExecutionEventStore } from '../task/execution-event-store';
+import {
+  classifyExecutionFailure,
+  type ExecutionEventType,
+} from '../task/execution-lifecycle';
 import type { ExecutionTask, TaskPatch, TaskRepository } from '../task/task-repository';
 
 const INTERNAL_STATUSES: readonly string[] = [
-  'pending', 'dispatching', 'running', 'completed', 'failed', 'cancelled',
+  'pending',
+  'dispatching',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
 ];
+
+const DEFAULT_STALE_EXECUTION_MS = 15 * 60_000;
 
 export interface TaskWorkerDeps {
   config: PersonalAIConfig;
@@ -26,8 +36,16 @@ export interface TaskWorkerDeps {
   adapter: AgentExecutionAdapter | null;
   logger: Logger;
   agentStore?: AgentStore;
-  onExecutionTerminalInTx?: (taskId: string, status: 'completed' | 'failed') => void;
+  eventStore?: ExecutionEventStore;
+  staleExecutionMs?: number;
+  onExecutionTerminalInTx?: (taskId: string, status: 'completed' | 'failed' | 'cancelled') => void;
   onStartupRecoverInTx?: () => void;
+  onTaskCompleted?: (params: {
+    userId: string;
+    taskId: string;
+    agentId: string | null;
+    result: string;
+  }) => void;
 }
 
 export class TaskWorker {
@@ -37,21 +55,95 @@ export class TaskWorker {
   constructor(private readonly deps: TaskWorkerDeps) {}
 
   start(): void {
-    const { recovered, staleDirect } = this.deps.repo.runInTransaction((): {
-      recovered: number;
-      staleDirect: number;
-    } => {
-      const recoveredCount: number = this.deps.repo.recover();
-      const staleDirectCount: number = this.deps.repo.failStaleDirectExecutions(
-        '服务重启导致流式执行中断',
+    const { recoveredCount, resumedCount, exhaustedCount, staleDirectCount } =
+      this.deps.repo.runInTransaction(() => {
+        const recovery = this.deps.repo.recoverDetailed();
+        for (const exec of recovery.resumedRunning) {
+          this.deps.eventStore?.record({
+            executionId: exec.id,
+            taskId: exec.task_id,
+            userId: exec.user_id,
+            eventType: 'recovered',
+            agentId: exec.agent_id,
+            status: exec.status,
+            message: `服务重启后发现已有外部任务 ${exec.external_task_id}，直接恢复轮询（不重复创建）`,
+            metadata: { external_task_id: exec.external_task_id },
+          });
+        }
+        for (const exec of recovery.resetToPending) {
+          this.deps.eventStore?.record({
+            executionId: exec.id,
+            taskId: exec.task_id,
+            userId: exec.user_id,
+            eventType: 'recovered',
+            agentId: exec.agent_id,
+            status: exec.status,
+            message: '服务重启后将未创建外部单的 dispatching 任务安全回退为 pending 重新派发',
+            metadata: { attempt_count: exec.attempt_count },
+          });
+        }
+        for (const exec of recovery.exhausted) {
+          this.deps.eventStore?.record({
+            executionId: exec.id,
+            taskId: exec.task_id,
+            userId: exec.user_id,
+            eventType: 'verification_required',
+            agentId: exec.agent_id,
+            status: exec.status,
+            message: exec.error ?? '派发重试次数超过上限，结果未确认，请核实后重试',
+            metadata: { error_category: exec.error_category, error_code: exec.error_code },
+          });
+          if (exec.task_id) {
+            this.deps.onExecutionTerminalInTx?.(exec.task_id, 'failed');
+          }
+        }
+
+        const staleDirect = this.deps.repo.failStaleDirectExecutionsAndList(
+          '服务重启导致流式执行中断，结果未能确认，请核实后重试',
+        );
+        for (const exec of staleDirect) {
+          this.deps.eventStore?.record({
+            executionId: exec.id,
+            taskId: exec.task_id,
+            userId: exec.user_id,
+            eventType: 'verification_required',
+            agentId: exec.agent_id,
+            status: exec.status,
+            message: exec.error ?? '服务重启导致流式执行中断，结果未能确认',
+            metadata: {
+              error_category: exec.error_category,
+              error_code: exec.error_code,
+              needs_verification: true,
+            },
+          });
+        }
+
+        this.deps.onStartupRecoverInTx?.();
+
+        return {
+          recoveredCount: recovery.resetToPending.length,
+          resumedCount: recovery.resumedRunning.length,
+          exhaustedCount: recovery.exhausted.length,
+          staleDirectCount: staleDirect.length,
+        };
+      });
+
+    if (recoveredCount + resumedCount > 0) {
+      this.deps.logger.info(
+        `[task-worker] 启动恢复 ${recoveredCount} 个待重派任务，续轮询 ${resumedCount} 个外部任务`,
       );
-      this.deps.onStartupRecoverInTx?.();
-      return { recovered: recoveredCount, staleDirect: staleDirectCount };
-    });
-    if (recovered > 0) this.deps.logger.info(`[task-worker] 恢复 ${recovered} 个未完成任务`);
-    if (staleDirect > 0) {
-      this.deps.logger.info(`[task-worker] 收敛 ${staleDirect} 个重启中断的 direct_llm 执行`);
     }
+    if (exhaustedCount > 0) {
+      this.deps.logger.warn(
+        `[task-worker] ${exhaustedCount} 个任务超过派发重试上限，已标记为需核实`,
+      );
+    }
+    if (staleDirectCount > 0) {
+      this.deps.logger.info(
+        `[task-worker] 收敛 ${staleDirectCount} 个重启中断的 direct_llm 执行（已标记需核实）`,
+      );
+    }
+
     this.timer = setInterval((): void => {
       void this.tick();
     }, Math.max(200, this.deps.multica.pollIntervalMs));
@@ -78,21 +170,57 @@ export class TaskWorker {
   }
 
   private applyPatchWithSync(
-    executionId: string,
-    taskId: string | null,
+    task: ExecutionTask,
     patch: TaskPatch,
+    event?: {
+      eventType: ExecutionEventType;
+      message?: string;
+      metadata?: Record<string, unknown>;
+    },
   ): boolean {
-    if (patch.status === 'completed' || patch.status === 'failed') {
-      const terminalStatus: 'completed' | 'failed' = patch.status;
+    const nextStatus = patch.status;
+    if (
+      nextStatus === 'completed' ||
+      nextStatus === 'failed' ||
+      nextStatus === 'cancelled'
+    ) {
+      const terminalStatus: 'completed' | 'failed' | 'cancelled' = nextStatus;
       return this.deps.repo.runInTransaction((): boolean => {
-        const applied: boolean = this.deps.repo.updateIfActive(executionId, patch);
-        if (applied && taskId) {
-          this.deps.onExecutionTerminalInTx?.(taskId, terminalStatus);
+        const applied: boolean = this.deps.repo.updateIfActive(task.id, patch);
+        if (!applied) return false;
+        if (event) {
+          this.deps.eventStore?.record({
+            executionId: task.id,
+            taskId: task.task_id,
+            userId: task.user_id,
+            eventType: event.eventType,
+            agentId: task.agent_id,
+            status: terminalStatus,
+            message: event.message,
+            metadata: event.metadata,
+          });
         }
-        return applied;
+        if (task.task_id) {
+          this.deps.onExecutionTerminalInTx?.(task.task_id, terminalStatus);
+        }
+        return true;
       });
     }
-    return this.deps.repo.updateIfActive(executionId, patch);
+
+    const applied = this.deps.repo.updateIfActive(task.id, patch);
+    if (applied && event) {
+      this.deps.eventStore?.record({
+        executionId: task.id,
+        taskId: task.task_id,
+        userId: task.user_id,
+        eventType: event.eventType,
+        agentId: task.agent_id,
+        status: nextStatus ?? task.status,
+        message: event.message,
+        metadata: event.metadata,
+      });
+    }
+    return applied;
   }
 
   /** 立即派发一个新建任务（Runtime 调用），与轮询互斥由 status 保证。 */
@@ -102,16 +230,31 @@ export class TaskWorker {
     if (task.execution_mode === 'direct_llm') return;
     const adapter: AgentExecutionAdapter | null = this.deps.adapter;
     if (!adapter) {
-      // 用终态保护写入：若此刻用户已取消，cancelled 优先，不被改写成 failed。
-      this.applyPatchWithSync(taskId, task.task_id, {
-        status: 'failed',
-        error: 'MultiCA 未启用（MULTICA_ENABLED=false）',
-        completed_at: new Date().toISOString(),
+      const classified = classifyExecutionFailure({
+        message: 'MultiCA 未启用（MULTICA_ENABLED=false）',
+        codeOverride: 'multica_disabled',
+        categoryOverride: 'non_retryable',
       });
+      this.applyPatchWithSync(
+        task,
+        {
+          status: 'failed',
+          error: classified.message,
+          error_category: classified.category,
+          error_code: classified.code,
+          retryable: classified.retryable,
+          needs_verification: classified.needsVerification,
+          completed_at: new Date().toISOString(),
+        },
+        {
+          eventType: 'failed',
+          message: classified.message,
+          metadata: { error_category: classified.category, error_code: classified.code },
+        },
+      );
       return;
     }
-    // 原子抢占：只有仍为 pending 才能进入 dispatching，
-    // 避免「读到 pending → 用户取消 → 写入 dispatching」覆盖终态。
+
     if (!this.deps.repo.claimForDispatch(taskId, new Date().toISOString())) {
       this.deps.logger.info(`[task-worker] 任务 ${taskId} 已非 pending（可能被取消），跳过派发`);
       return;
@@ -126,14 +269,21 @@ export class TaskWorker {
         agentId: this.resolveExternalAssignee(task.agent_id),
         projectId: task.project_id ?? undefined,
       });
-      const applied: boolean = this.deps.repo.updateIfActive(taskId, {
-        status: 'running',
-        external_task_id: created.externalTaskId,
-        progress_message: `已创建 MultiCA issue ${created.externalTaskId}（${created.status}）`,
-      });
+      const applied: boolean = this.applyPatchWithSync(
+        task,
+        {
+          status: 'running',
+          external_task_id: created.externalTaskId,
+          progress_message: `已创建 MultiCA issue ${created.externalTaskId}（${created.status}）`,
+        },
+        {
+          eventType: 'started',
+          message: `已派发至 MultiCA (${created.externalTaskId})，Agent 开始执行`,
+          metadata: { external_task_id: created.externalTaskId, external_status: created.status },
+        },
+      );
       if (!applied) {
-        // createTask 窗口内任务已被取消/已完成：状态保持不变，只补记外部 id（便于审计与回收），
-        // 并尽力取消外部 run，避免留下无人认领的 Agent 执行。
+        // createTask 窗口内任务已被取消/已完成：补记外部 id 便于审计并尽力取消外部 run。
         this.deps.repo.update(taskId, {
           external_task_id: created.externalTaskId,
           progress_message: '任务已进入终态，已尽力回收外部 run',
@@ -146,11 +296,33 @@ export class TaskWorker {
         );
       }
     } catch (error) {
-      this.applyPatchWithSync(taskId, task.task_id, {
-        status: 'failed',
-        error: `派发失败：${error instanceof Error ? error.message : String(error)}`,
-        completed_at: new Date().toISOString(),
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      const errorKind = error instanceof MultiCAError ? error.kind : undefined;
+      const classified = classifyExecutionFailure({
+        message: `派发失败：${rawMessage}`,
+        errorKind,
       });
+      this.applyPatchWithSync(
+        task,
+        {
+          status: 'failed',
+          error: classified.message,
+          error_category: classified.category,
+          error_code: classified.code,
+          retryable: classified.retryable,
+          needs_verification: classified.needsVerification,
+          completed_at: new Date().toISOString(),
+        },
+        {
+          eventType: classified.needsVerification ? 'verification_required' : 'failed',
+          message: classified.message,
+          metadata: {
+            error_category: classified.category,
+            error_code: classified.code,
+            retryable: classified.retryable,
+          },
+        },
+      );
     }
   }
 
@@ -158,6 +330,10 @@ export class TaskWorker {
     const adapter: AgentExecutionAdapter | null = this.deps.adapter;
     if (!adapter || !task.external_task_id) return;
     const patch: TaskPatch = { increment_poll: true };
+    let pollEvent:
+      | { eventType: ExecutionEventType; message?: string; metadata?: Record<string, unknown> }
+      | undefined;
+
     try {
       const status = await adapter.getTaskStatus(task.external_task_id);
       const raw: string = status.status ?? 'unknown';
@@ -176,40 +352,172 @@ export class TaskWorker {
         if (result.status === 'completed') {
           patch.status = 'completed';
           patch.result = result.content ?? '';
+          patch.error_category = null;
+          patch.error_code = null;
+          patch.retryable = false;
+          patch.needs_verification = false;
+          pollEvent = {
+            eventType: 'completed',
+            message: '外部 Agent 执行完成',
+            metadata: { external_task_id: task.external_task_id },
+          };
         } else {
+          const classified = classifyExecutionFailure({
+            message: result.error ?? 'Agent 未返回结果',
+          });
           patch.status = 'failed';
-          patch.error = result.error ?? 'Agent 未返回结果';
+          patch.error = classified.message;
+          patch.error_category = classified.category;
+          patch.error_code = classified.code;
+          patch.retryable = classified.retryable;
+          patch.needs_verification = classified.needsVerification;
+          pollEvent = {
+            eventType: classified.needsVerification ? 'verification_required' : 'failed',
+            message: classified.message,
+            metadata: {
+              error_category: classified.category,
+              error_code: classified.code,
+              retryable: classified.retryable,
+            },
+          };
         }
-      } else if (mapped === 'failed' || mapped === 'cancelled') {
-        patch.status = 'failed';
-        patch.error = `MultiCA 任务状态：${status.rawStatus ?? raw}`;
+      } else if (mapped === 'cancelled') {
+        const reason = `外部任务已取消（${status.rawStatus ?? raw}）`;
+        patch.status = 'cancelled';
+        patch.error = reason;
+        patch.error_category = 'cancelled';
+        patch.error_code = 'external_cancelled';
+        patch.retryable = false;
+        patch.needs_verification = false;
         patch.completed_at = new Date().toISOString();
+        pollEvent = {
+          eventType: 'cancelled',
+          message: reason,
+          metadata: { external_task_id: task.external_task_id },
+        };
+      } else if (mapped === 'failed') {
+        const classified = classifyExecutionFailure({
+          message: `MultiCA 任务失败：${status.rawStatus ?? raw}`,
+        });
+        patch.status = 'failed';
+        patch.error = classified.message;
+        patch.error_category = classified.category;
+        patch.error_code = classified.code;
+        patch.retryable = classified.retryable;
+        patch.needs_verification = classified.needsVerification;
+        patch.completed_at = new Date().toISOString();
+        pollEvent = {
+          eventType: 'failed',
+          message: classified.message,
+          metadata: {
+            error_category: classified.category,
+            error_code: classified.code,
+            retryable: classified.retryable,
+          },
+        };
       } else {
         patch.status = 'running';
+        patch.last_progress_at = new Date().toISOString();
+        if (status.message && status.message !== task.progress_message) {
+          pollEvent = {
+            eventType: 'progress',
+            message: status.message,
+            metadata: { poll_count: task.poll_count + 1 },
+          };
+        }
       }
     } catch (error) {
-      // 单次轮询失败不立即判定任务失败，由 maxPolls 控制重试上限。
-      patch.progress_message = `轮询暂失败：${error instanceof Error ? error.message : String(error)}`;
+      // 单次轮询网络/CLI抖动不立即判死，由 maxPolls 与僵死超时控制安全兜底。
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      patch.progress_message = `轮询暂失败：${rawMessage}`;
+      pollEvent = {
+        eventType: 'progress',
+        message: patch.progress_message,
+        metadata: { transient_poll_error: true, poll_count: task.poll_count + 1 },
+      };
     }
 
-    if (task.poll_count + 1 > this.deps.multica.maxPolls) {
+    if (
+      patch.status !== 'completed' &&
+      patch.status !== 'failed' &&
+      patch.status !== 'cancelled' &&
+      task.poll_count + 1 > this.deps.multica.maxPolls
+    ) {
+      const classified = classifyExecutionFailure({
+        message: `轮询次数超过上限（${this.deps.multica.maxPolls}），结果尚未确认，请核实后重试`,
+        codeOverride: 'poll_limit_exceeded',
+        categoryOverride: 'needs_verification',
+      });
       patch.status = 'failed';
-      patch.error = `轮询次数超过上限（${this.deps.multica.maxPolls}）`;
+      patch.error = classified.message;
+      patch.error_category = classified.category;
+      patch.error_code = classified.code;
+      patch.retryable = classified.retryable;
+      patch.needs_verification = classified.needsVerification;
       patch.completed_at = new Date().toISOString();
+      pollEvent = {
+        eventType: 'verification_required',
+        message: classified.message,
+        metadata: { poll_count: task.poll_count + 1, needs_verification: true },
+      };
     }
-    // 终态保护：快照可能已过期（用户在这段异步 CLI 调用期间取消/任务已被判定终态），
-    // 因此用带 `status IN (活动态)` 条件的 SQL 回写，并在同事务内同步业务 Task 状态。
-    const applied: boolean = this.applyPatchWithSync(task.id, task.task_id, patch);
+
+    const applied: boolean = this.applyPatchWithSync(task, patch, pollEvent);
     if (!applied) {
       this.deps.logger.info(`[task-worker] 任务 ${task.id} 已进入终态，丢弃本次轮询结果`);
+      return;
+    }
+    if (patch.status === 'completed' && task.task_id && typeof patch.result === 'string') {
+      this.deps.onTaskCompleted?.({
+        userId: task.user_id,
+        taskId: task.task_id,
+        agentId: task.agent_id,
+        result: patch.result,
+      });
     }
   }
 
-  /** 一轮轮询：并发数由「本轮取出的任务数」限制。 */
+  /** 检查并收敛长时间无进展的外部执行，避免静默卡死或假定成功。 */
+  private reconcileStalledExecutions(): void {
+    const staleMs = this.deps.staleExecutionMs ?? DEFAULT_STALE_EXECUTION_MS;
+    if (staleMs <= 0) return;
+    const staleBeforeIso = new Date(Date.now() - staleMs).toISOString();
+    const stalled = this.deps.repo.runInTransaction((): ExecutionTask[] => {
+      const rows = this.deps.repo.failStalledExternalExecutions(staleBeforeIso);
+      for (const exec of rows) {
+        this.deps.eventStore?.record({
+          executionId: exec.id,
+          taskId: exec.task_id,
+          userId: exec.user_id,
+          eventType: 'verification_required',
+          agentId: exec.agent_id,
+          status: 'failed',
+          message: exec.error ?? '执行长时间无进展，结果无法确认，请核实后重试',
+          metadata: {
+            error_category: exec.error_category,
+            error_code: exec.error_code,
+            needs_verification: true,
+          },
+        });
+        if (exec.task_id) {
+          this.deps.onExecutionTerminalInTx?.(exec.task_id, 'failed');
+        }
+      }
+      return rows;
+    });
+    if (stalled.length > 0) {
+      this.deps.logger.warn(
+        `[task-worker] 检测到 ${stalled.length} 个长时间无进展的 Execution，已收敛为 failed + 需核实`,
+      );
+    }
+  }
+
+  /** 一轮轮询：清理僵死超时任务后，按并发上限派发/轮询活跃任务。 */
   async tick(): Promise<void> {
     if (this.busy) return;
     this.busy = true;
     try {
+      this.reconcileStalledExecutions();
       const tasks: ExecutionTask[] = this.deps.repo.listActive(this.deps.multica.maxConcurrentTasks);
       for (const task of tasks) {
         if (!task.external_task_id && task.status === 'pending') {

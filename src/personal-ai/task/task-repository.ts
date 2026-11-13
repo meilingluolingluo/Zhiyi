@@ -22,6 +22,12 @@ export interface ExecutionTask {
   input_summary: string | null;
   result: string | null;
   error: string | null;
+  error_category: string | null;
+  error_code: string | null;
+  retryable: boolean;
+  needs_verification: boolean;
+  retry_of_execution_id: string | null;
+  last_progress_at: string | null;
   progress_message: string | null;
   poll_count: number;
   attempt_count: number;
@@ -29,6 +35,23 @@ export interface ExecutionTask {
   started_at: string | null;
   completed_at: string | null;
   updated_at: string;
+}
+
+interface RawExecutionTaskRow extends Omit<ExecutionTask, 'retryable' | 'needs_verification'> {
+  retryable: number | boolean;
+  needs_verification: number | boolean;
+}
+
+function rowToExecutionTask(row: RawExecutionTaskRow): ExecutionTask {
+  return {
+    ...row,
+    error_category: row.error_category ?? null,
+    error_code: row.error_code ?? null,
+    retryable: Boolean(row.retryable),
+    needs_verification: Boolean(row.needs_verification),
+    retry_of_execution_id: row.retry_of_execution_id ?? null,
+    last_progress_at: row.last_progress_at ?? null,
+  };
 }
 
 export interface NewExecutionTask {
@@ -42,6 +65,7 @@ export interface NewExecutionTask {
   input_summary: string;
   initial_status?: 'pending' | 'running';
   started_at?: string | null;
+  retry_of_execution_id?: string | null;
 }
 
 export interface TaskPatch {
@@ -50,6 +74,11 @@ export interface TaskPatch {
   external_run_id?: string | null;
   result?: string | null;
   error?: string | null;
+  error_category?: string | null;
+  error_code?: string | null;
+  retryable?: boolean;
+  needs_verification?: boolean;
+  last_progress_at?: string | null;
   progress_message?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
@@ -63,6 +92,11 @@ const PATCH_COLUMNS: Readonly<Record<keyof TaskPatch, string>> = {
   external_run_id: 'external_run_id',
   result: 'result',
   error: 'error',
+  error_category: 'error_category',
+  error_code: 'error_code',
+  retryable: 'retryable',
+  needs_verification: 'needs_verification',
+  last_progress_at: 'last_progress_at',
   progress_message: 'progress_message',
   started_at: 'started_at',
   completed_at: 'completed_at',
@@ -72,11 +106,16 @@ const PATCH_COLUMNS: Readonly<Record<keyof TaskPatch, string>> = {
 
 /**
  * 「活动态」枚举（可直接拼进 SQL 的 IN 列表）。
- *
- * 与 `ExecutionStatus` 的终态互补：completed / failed / cancelled 一旦写入，
- * 后台 Worker 的旧快照轮询结果不得再覆盖它（见 ARCHITECTURE.md §9）。
+ * 与 ExecutionStatus 的终态（completed / failed / cancelled）互斥，
+ * 用于保障后台旧快照轮询不得覆盖已终结记录。
  */
 const ACTIVE_STATUS_SQL = "'pending','dispatching','running'";
+
+export interface RecoveryOutcome {
+  resetToPending: ExecutionTask[];
+  resumedRunning: ExecutionTask[];
+  exhausted: ExecutionTask[];
+}
 
 export class TaskRepository {
   constructor(private readonly db: Database) {}
@@ -90,14 +129,18 @@ export class TaskRepository {
     const now: string = new Date().toISOString();
     const id: string = `task_${randomUUID()}`;
     const idempotencyKey: string = `${input.user_id}:${input.request_id}`;
-    const initialStatus: 'pending' | 'running' = input.initial_status === 'running' ? 'running' : 'pending';
-    const startedAt: string | null = initialStatus === 'running' ? (input.started_at ?? now) : null;
+    const initialStatus: 'pending' | 'running' =
+      input.initial_status === 'running' ? 'running' : 'pending';
+    const startedAt: string | null =
+      initialStatus === 'running' ? (input.started_at ?? now) : null;
+    const lastProgressAt: string | null = initialStatus === 'running' ? startedAt : null;
     const attemptCount: number = initialStatus === 'running' ? 1 : 0;
     const result = this.db.run(
       `INSERT OR IGNORE INTO execution_tasks
          (id, task_id, user_id, conversation_id, request_id, idempotency_key, agent_id, project_id,
-          execution_mode, status, input_summary, attempt_count, started_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          execution_mode, status, input_summary, retry_of_execution_id, attempt_count,
+          started_at, last_progress_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         input.task_id ?? null,
@@ -110,53 +153,62 @@ export class TaskRepository {
         input.execution_mode,
         initialStatus,
         input.input_summary.slice(0, 2000),
+        input.retry_of_execution_id ?? null,
         attemptCount,
         startedAt,
+        lastProgressAt,
         now,
         now,
       ],
     );
-    const task: ExecutionTask = this.db.get<ExecutionTask>(
+    const row = this.db.get<RawExecutionTaskRow>(
       'SELECT * FROM execution_tasks WHERE idempotency_key = ?',
       [idempotencyKey],
-    ) as ExecutionTask;
-    return { task, created: result.changes > 0 };
+    ) as RawExecutionTaskRow;
+    return { task: rowToExecutionTask(row), created: result.changes > 0 };
   }
 
   get(userId: string, id: string): ExecutionTask | undefined {
-    return this.db.get<ExecutionTask>(
+    const row = this.db.get<RawExecutionTaskRow>(
       'SELECT * FROM execution_tasks WHERE id = ? AND user_id = ?',
       [id, userId],
     );
+    return row ? rowToExecutionTask(row) : undefined;
   }
 
   /** Worker 内部使用：按主键读取，不暴露给用户路由。 */
   getById(id: string): ExecutionTask | undefined {
-    return this.db.get<ExecutionTask>('SELECT * FROM execution_tasks WHERE id = ?', [id]);
+    const row = this.db.get<RawExecutionTaskRow>('SELECT * FROM execution_tasks WHERE id = ?', [id]);
+    return row ? rowToExecutionTask(row) : undefined;
   }
 
   getByRequestId(userId: string, requestId: string): ExecutionTask | undefined {
-    return this.db.get<ExecutionTask>(
+    const row = this.db.get<RawExecutionTaskRow>(
       'SELECT * FROM execution_tasks WHERE user_id = ? AND idempotency_key = ?',
       [userId, `${userId}:${requestId}`],
     );
+    return row ? rowToExecutionTask(row) : undefined;
   }
 
   listForUser(userId: string, limit = 50): ExecutionTask[] {
-    return this.db.all<ExecutionTask>(
-      'SELECT * FROM execution_tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
-      [userId, Math.min(Math.max(1, limit), 200)],
-    );
+    return this.db
+      .all<RawExecutionTaskRow>(
+        'SELECT * FROM execution_tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+        [userId, Math.min(Math.max(1, limit), 200)],
+      )
+      .map(rowToExecutionTask);
   }
 
   listActive(limit: number): ExecutionTask[] {
-    return this.db.all<ExecutionTask>(
-      `SELECT * FROM execution_tasks
-        WHERE execution_mode != 'direct_llm'
-          AND status IN ('pending', 'dispatching', 'running')
-        ORDER BY updated_at ASC LIMIT ?`,
-      [Math.max(1, limit)],
-    );
+    return this.db
+      .all<RawExecutionTaskRow>(
+        `SELECT * FROM execution_tasks
+          WHERE execution_mode != 'direct_llm'
+            AND status IN (${ACTIVE_STATUS_SQL})
+          ORDER BY updated_at ASC LIMIT ?`,
+        [Math.max(1, limit)],
+      )
+      .map(rowToExecutionTask);
   }
 
   listByTaskId(
@@ -171,33 +223,38 @@ export class TaskRepository {
       'SELECT COUNT(*) AS total FROM execution_tasks WHERE user_id = ? AND task_id = ?',
       [userId, taskId],
     );
-    const items = this.db.all<ExecutionTask>(
-      `SELECT * FROM execution_tasks
-        WHERE user_id = ? AND task_id = ?
-        ORDER BY created_at DESC, rowid DESC, id DESC
-        LIMIT ? OFFSET ?`,
-      [userId, taskId, safeLimit, safeOffset],
-    );
+    const items = this.db
+      .all<RawExecutionTaskRow>(
+        `SELECT * FROM execution_tasks
+          WHERE user_id = ? AND task_id = ?
+          ORDER BY created_at DESC, rowid DESC, id DESC
+          LIMIT ? OFFSET ?`,
+        [userId, taskId, safeLimit, safeOffset],
+      )
+      .map(rowToExecutionTask);
     return { items, total: Number(totalRow?.total ?? 0) };
   }
 
   getLatestByTaskId(userId: string, taskId: string): ExecutionTask | undefined {
-    return this.db.get<ExecutionTask>(
+    const row = this.db.get<RawExecutionTaskRow>(
       `SELECT * FROM execution_tasks
         WHERE user_id = ? AND task_id = ?
         ORDER BY created_at DESC, rowid DESC, id DESC
         LIMIT 1`,
       [userId, taskId],
     );
+    return row ? rowToExecutionTask(row) : undefined;
   }
 
   listActiveByTaskId(userId: string, taskId: string): ExecutionTask[] {
-    return this.db.all<ExecutionTask>(
-      `SELECT * FROM execution_tasks
-        WHERE user_id = ? AND task_id = ? AND status IN (${ACTIVE_STATUS_SQL})
-        ORDER BY created_at DESC, rowid DESC, id DESC`,
-      [userId, taskId],
-    );
+    return this.db
+      .all<RawExecutionTaskRow>(
+        `SELECT * FROM execution_tasks
+          WHERE user_id = ? AND task_id = ? AND status IN (${ACTIVE_STATUS_SQL})
+          ORDER BY created_at DESC, rowid DESC, id DESC`,
+        [userId, taskId],
+      )
+      .map(rowToExecutionTask);
   }
 
   hasActiveByTaskId(taskId: string): boolean {
@@ -227,10 +284,14 @@ export class TaskRepository {
     return Number(row?.total ?? 0);
   }
 
-  /** 把 TaskPatch 编译成 SET 片段（`updated_at` 恒更新，排除在参数末尾之外）。 */
+  /** 把 TaskPatch 编译成 SET 片段（updated_at 恒更新；有进度变化时同步推进心跳时间）。 */
   private buildPatch(patch: TaskPatch): { sets: string[]; params: unknown[] } {
     const sets: string[] = [];
     const params: unknown[] = [];
+    const now: string = new Date().toISOString();
+    let hasExplicitLastProgress = false;
+    let shouldTouchProgress = false;
+
     for (const [key, value] of Object.entries(patch) as Array<[keyof TaskPatch, unknown]>) {
       if (key === 'increment_poll') {
         if (value === true) sets.push('poll_count = poll_count + 1');
@@ -240,13 +301,31 @@ export class TaskRepository {
         if (value === true) sets.push('attempt_count = attempt_count + 1');
         continue;
       }
+      if (key === 'last_progress_at') {
+        hasExplicitLastProgress = true;
+      }
+      if (
+        (key === 'progress_message' && typeof value === 'string' && value.trim() !== '') ||
+        (key === 'status' && value === 'running')
+      ) {
+        shouldTouchProgress = true;
+      }
       const column: string = PATCH_COLUMNS[key];
       if (!column) continue;
       sets.push(`${column} = ?`);
-      params.push(value ?? null);
+      if (key === 'retryable' || key === 'needs_verification') {
+        params.push(value ? 1 : 0);
+      } else {
+        params.push(value ?? null);
+      }
+    }
+
+    if (!hasExplicitLastProgress && shouldTouchProgress) {
+      sets.push('last_progress_at = ?');
+      params.push(now);
     }
     sets.push('updated_at = ?');
-    params.push(new Date().toISOString());
+    params.push(now);
     return { sets, params };
   }
 
@@ -258,12 +337,7 @@ export class TaskRepository {
 
   /**
    * 终态保护更新（CAS）：仅当任务仍处于活动态（pending / dispatching / running）时写入。
-   *
-   * 后台 Worker 的轮询是「快照 → 异步 CLI → 回写」，中间窗口内用户可能取消任务。
-   * 用带 `status IN (...)` 条件的单条 SQL 回写，保证终态不可被旧快照覆盖
-   * （SQLite 单语句原子执行，不存在读-改-写丢更新）。
-   *
-   * @returns true = 已写入；false = 任务已是终态或不存在，调用方应放弃回写。
+   * 保证后台轮询旧快照回写不可覆盖已写入的 completed / failed / cancelled 终态。
    */
   updateIfActive(id: string, patch: TaskPatch): boolean {
     const { sets, params } = this.buildPatch(patch);
@@ -274,49 +348,159 @@ export class TaskRepository {
     return result.changes > 0;
   }
 
-  /**
-   * 原子抢占派发权：仅当任务仍是 `pending` 时切到 `dispatching`。
-   *
-   * 用一条 UPDATE 完成「校验 + 状态流转」，避免「读到 pending → 用户取消 →
-   * 写入 dispatching」把 cancelled 覆盖掉。成功时累加 attempt_count。
-   *
-   * @returns true = 抢占成功；false = 任务已被取消、已被别的轮次派发或不存在。
-   */
+  /** 原子抢占派发权：仅当任务仍是 pending 时切到 dispatching，防止覆盖已取消状态。 */
   claimForDispatch(id: string, startedAt: string): boolean {
+    const now: string = new Date().toISOString();
     const result = this.db.run(
       `UPDATE execution_tasks
           SET status = 'dispatching',
               started_at = COALESCE(started_at, ?),
+              last_progress_at = COALESCE(last_progress_at, ?),
               attempt_count = attempt_count + 1,
               updated_at = ?
         WHERE id = ? AND status = 'pending'`,
-      [startedAt, new Date().toISOString(), id],
+      [startedAt, now, now, id],
     );
     return result.changes > 0;
   }
 
-  /** 服务重启后恢复：把上一进程遗留的 dispatching 回退为 pending 重新派发。 */
-  recover(): number {
-    const result = this.db.run(
-      `UPDATE execution_tasks SET status = 'pending', updated_at = ? WHERE status = 'dispatching'`,
-      [new Date().toISOString()],
-    );
-    return result.changes;
+  /**
+   * 服务重启恢复：
+   * - 已持有 external_task_id 的 dispatching 记录恢复为 running（直接续轮询，不重复建外部任务）；
+   * - 未超出重试上限且无 external_task_id 的 dispatching 记录回退为 pending；
+   * - 超出上限的记录收敛为 failed + needs_verification，避免无限死循环。
+   */
+  recoverDetailed(maxAttempts = 3): RecoveryOutcome {
+    const now: string = new Date().toISOString();
+    const rows = this.db
+      .all<RawExecutionTaskRow>(`SELECT * FROM execution_tasks WHERE status = 'dispatching'`)
+      .map(rowToExecutionTask);
+
+    const resetToPending: ExecutionTask[] = [];
+    const resumedRunning: ExecutionTask[] = [];
+    const exhausted: ExecutionTask[] = [];
+
+    for (const row of rows) {
+      if (row.external_task_id) {
+        const res = this.db.run(
+          `UPDATE execution_tasks
+              SET status = 'running',
+                  last_progress_at = COALESCE(last_progress_at, ?),
+                  updated_at = ?
+            WHERE id = ? AND status = 'dispatching'`,
+          [now, now, row.id],
+        );
+        if (res.changes > 0) resumedRunning.push(this.getById(row.id) ?? row);
+      } else if (row.attempt_count < maxAttempts) {
+        const res = this.db.run(
+          `UPDATE execution_tasks
+              SET status = 'pending',
+                  updated_at = ?
+            WHERE id = ? AND status = 'dispatching'`,
+          [now, row.id],
+        );
+        if (res.changes > 0) resetToPending.push(this.getById(row.id) ?? row);
+      } else {
+        const res = this.db.run(
+          `UPDATE execution_tasks
+              SET status = 'failed',
+                  error = COALESCE(error, '派发重试次数超过上限，结果未确认，请核实后重试'),
+                  error_category = 'needs_verification',
+                  error_code = 'dispatch_retry_limit_exceeded',
+                  retryable = 1,
+                  needs_verification = 1,
+                  completed_at = COALESCE(completed_at, ?),
+                  updated_at = ?
+            WHERE id = ? AND status = 'dispatching'`,
+          [now, now, row.id],
+        );
+        if (res.changes > 0) exhausted.push(this.getById(row.id) ?? row);
+      }
+    }
+
+    return { resetToPending, resumedRunning, exhausted };
   }
 
-  /** 服务重启后清理：direct_llm 内存流不可跨重启续跑，将遗留活跃项标为 failed。 */
-  failStaleDirectExecutions(reason: string): number {
+  /** 服务重启后恢复：把上一进程遗留的 dispatching 恢复或安全收敛，返回处理的记录数。 */
+  recover(maxAttempts = 3): number {
+    const outcome = this.recoverDetailed(maxAttempts);
+    return (
+      outcome.resetToPending.length +
+      outcome.resumedRunning.length +
+      outcome.exhausted.length
+    );
+  }
+
+  /** 服务重启后清理：direct_llm 内存流不可跨重启续跑，标为 failed 且标记需人工核实，返回受影响记录。 */
+  failStaleDirectExecutionsAndList(reason: string): ExecutionTask[] {
     const now: string = new Date().toISOString();
-    const result = this.db.run(
+    const candidates = this.db
+      .all<RawExecutionTaskRow>(
+        `SELECT * FROM execution_tasks
+          WHERE execution_mode = 'direct_llm'
+            AND status IN (${ACTIVE_STATUS_SQL})`,
+      )
+      .map(rowToExecutionTask);
+
+    if (candidates.length === 0) return [];
+
+    this.db.run(
       `UPDATE execution_tasks
           SET status = 'failed',
               error = COALESCE(error, ?),
+              error_category = 'needs_verification',
+              error_code = 'process_restarted',
+              retryable = 1,
+              needs_verification = 1,
               completed_at = COALESCE(completed_at, ?),
               updated_at = ?
         WHERE execution_mode = 'direct_llm'
           AND status IN (${ACTIVE_STATUS_SQL})`,
       [reason, now, now],
     );
-    return result.changes;
+    return candidates
+      .map((item) => this.getById(item.id))
+      .filter((item): item is ExecutionTask => item !== undefined);
+  }
+
+  failStaleDirectExecutions(reason: string): number {
+    return this.failStaleDirectExecutionsAndList(reason).length;
+  }
+
+  /** 检测长时间无进展的外部 Agent Execution 并标为 failed + needs_verification，避免静默假定成功。 */
+  failStalledExternalExecutions(staleBeforeIso: string): ExecutionTask[] {
+    const candidates = this.db
+      .all<RawExecutionTaskRow>(
+        `SELECT * FROM execution_tasks
+          WHERE execution_mode != 'direct_llm'
+            AND status = 'running'
+            AND COALESCE(last_progress_at, started_at, created_at) < ?`,
+        [staleBeforeIso],
+      )
+      .map(rowToExecutionTask);
+
+    if (candidates.length === 0) return [];
+    const now: string = new Date().toISOString();
+    const updated: ExecutionTask[] = [];
+    for (const item of candidates) {
+      const res = this.db.run(
+        `UPDATE execution_tasks
+            SET status = 'failed',
+                error = '执行长时间无进展，结果无法确认，请核实后重试',
+                error_category = 'needs_verification',
+                error_code = 'execution_stalled',
+                retryable = 1,
+                needs_verification = 1,
+                completed_at = COALESCE(completed_at, ?),
+                updated_at = ?
+          WHERE id = ? AND status = 'running'`,
+        [now, now, item.id],
+      );
+      if (res.changes > 0) {
+        const latest = this.getById(item.id);
+        if (latest) updated.push(latest);
+      }
+    }
+    return updated;
   }
 }

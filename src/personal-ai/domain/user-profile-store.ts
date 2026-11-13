@@ -7,8 +7,12 @@
 import type { Database } from '../../db';
 import {
   DomainError,
+  PROACTIVE_FREQUENCIES,
+  PROACTIVE_NOTIFICATION_KINDS,
   RESPONSE_STYLES,
   type EnsureUserOptions,
+  type ProactiveFrequency,
+  type ProactiveNotificationKind,
   type ResponseStyle,
   type TimezoneSource,
   type UserPreferences,
@@ -22,6 +26,7 @@ const MAX_DISPLAY_NAME_LEN = 120;
 const MAX_LANGUAGE_LEN = 32;
 const MAX_CONVENTIONS = 20;
 const MAX_CONVENTION_LEN = 200;
+const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 const WORK_STYLE_KEYS: ReadonlySet<string> = new Set([
   'response_style',
@@ -31,6 +36,11 @@ const WORK_STYLE_KEYS: ReadonlySet<string> = new Set([
 const PREFERENCE_KEYS: ReadonlySet<string> = new Set([
   'default_project_id',
   'memory_injection_enabled',
+  'proactive_enabled',
+  'proactive_frequency',
+  'proactive_types',
+  'proactive_quiet_hours',
+  'proactive_paused_until',
 ]);
 
 interface UserRow {
@@ -177,6 +187,95 @@ function validateAndMergePreferences(
       merged.memory_injection_enabled = val;
     } else {
       throw new DomainError(400, 'invalid_preferences', 'preferences.memory_injection_enabled 必须为布尔值');
+    }
+  }
+
+  if ('proactive_enabled' in patch) {
+    const val: unknown = patch.proactive_enabled;
+    if (val === null) {
+      delete merged.proactive_enabled;
+    } else if (typeof val === 'boolean') {
+      merged.proactive_enabled = val;
+    } else {
+      throw new DomainError(400, 'invalid_preferences', 'preferences.proactive_enabled 必须为布尔值');
+    }
+  }
+
+  if ('proactive_frequency' in patch) {
+    const val: unknown = patch.proactive_frequency;
+    if (val === null) {
+      delete merged.proactive_frequency;
+    } else if (typeof val === 'string' && PROACTIVE_FREQUENCIES.includes(val as ProactiveFrequency)) {
+      merged.proactive_frequency = val as ProactiveFrequency;
+    } else {
+      throw new DomainError(
+        400,
+        'invalid_preferences',
+        `preferences.proactive_frequency 必须为 ${PROACTIVE_FREQUENCIES.join(' | ')}`,
+      );
+    }
+  }
+
+  if ('proactive_types' in patch) {
+    const val: unknown = patch.proactive_types;
+    if (val === null) {
+      delete merged.proactive_types;
+    } else if (Array.isArray(val)) {
+      const cleaned: ProactiveNotificationKind[] = [];
+      for (const item of val) {
+        if (
+          typeof item !== 'string' ||
+          !PROACTIVE_NOTIFICATION_KINDS.includes(item as ProactiveNotificationKind)
+        ) {
+          throw new DomainError(
+            400,
+            'invalid_preferences',
+            `preferences.proactive_types 包含非法提醒类型: ${String(item)}`,
+          );
+        }
+        if (!cleaned.includes(item as ProactiveNotificationKind)) {
+          cleaned.push(item as ProactiveNotificationKind);
+        }
+      }
+      merged.proactive_types = cleaned;
+    } else {
+      throw new DomainError(400, 'invalid_preferences', 'preferences.proactive_types 必须为数组或 null');
+    }
+  }
+
+  if ('proactive_quiet_hours' in patch) {
+    const val: unknown = patch.proactive_quiet_hours;
+    if (val === null) {
+      merged.proactive_quiet_hours = null;
+    } else if (isPlainRecord(val)) {
+      assertSafeJsonKeys(val, new Set(['start', 'end']), 'preferences.proactive_quiet_hours');
+      const start = typeof val.start === 'string' ? val.start.trim() : '';
+      const end = typeof val.end === 'string' ? val.end.trim() : '';
+      if (!HHMM_RE.test(start) || !HHMM_RE.test(end)) {
+        throw new DomainError(
+          400,
+          'invalid_preferences',
+          'preferences.proactive_quiet_hours.start/end 必须为 HH:mm（00:00-23:59）',
+        );
+      }
+      merged.proactive_quiet_hours = { start, end };
+    } else {
+      throw new DomainError(400, 'invalid_preferences', 'preferences.proactive_quiet_hours 必须为对象或 null');
+    }
+  }
+
+  if ('proactive_paused_until' in patch) {
+    const val: unknown = patch.proactive_paused_until;
+    if (val === null || val === '') {
+      merged.proactive_paused_until = null;
+    } else if (typeof val === 'string' && Number.isFinite(Date.parse(val.trim()))) {
+      merged.proactive_paused_until = new Date(Date.parse(val.trim())).toISOString();
+    } else {
+      throw new DomainError(
+        400,
+        'invalid_preferences',
+        'preferences.proactive_paused_until 必须为合法 ISO 时间字符串或 null',
+      );
     }
   }
 
