@@ -59,6 +59,7 @@ export interface ProviderPreset {
   description: string;
   defaultModel?: string;
   upstreamProtocol?: UpstreamProtocol;
+  models?: string[];
 }
 
 export const DEFAULT_DUCX_EXECUTABLE: string = path.join(
@@ -81,6 +82,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     defaultModel: 'deepseek-chat',
     upstreamProtocol: 'openai_chat',
     description: 'DeepSeek 官方标准 API，提供 deepseek-chat 与 deepseek-reasoner 模型',
+    models: ['deepseek-chat', 'deepseek-reasoner'],
   },
   {
     id: 'openai',
@@ -92,6 +94,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     defaultModel: 'gpt-4o',
     upstreamProtocol: 'openai_chat',
     description: 'OpenAI 官方标准 API，提供 GPT-4o、GPT-4o-mini 等模型',
+    models: ['gpt-4o', 'gpt-4o-mini', 'o1', 'o3-mini', 'gpt-4-turbo'],
   },
   {
     id: 'anthropic',
@@ -103,6 +106,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     defaultModel: 'claude-3-7-sonnet-20250219',
     upstreamProtocol: 'anthropic_messages',
     description: 'Anthropic 官方 Messages 协议 API，提供 Claude 3.5 / 3.7 系列模型',
+    models: ['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022'],
   },
   {
     id: 'custom',
@@ -114,6 +118,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     defaultModel: 'llama3.3',
     upstreamProtocol: 'openai_chat',
     description: '适配 Ollama、vLLM、LocalAI 或任意第三方标准 OpenAI 兼容中转',
+    models: ['llama3.3', 'qwen2.5-coder:32b', 'deepseek-r1'],
   },
   {
     id: 'baidu-oneapi-ducx',
@@ -125,6 +130,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     defaultModel: 'DeepSeek-V4-Flash-baidu-oneapi',
     upstreamProtocol: 'auto',
     description: '企业统一接口，支持本机 DUCX 免密登录态或 API 令牌',
+    models: ['DeepSeek-V4-Flash-baidu-oneapi', 'DeepSeek-V4-Pro-baidu-oneapi', 'Grok-4.7-baidu-oneapi'],
   },
   {
     id: 'local-proxy',
@@ -136,6 +142,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     defaultModel: 'DeepSeek-V4-Flash-baidu-oneapi',
     upstreamProtocol: 'auto',
     description: '本地 8787 端口代理服务',
+    models: ['DeepSeek-V4-Flash-baidu-oneapi', 'DeepSeek-V4-Pro-baidu-oneapi'],
   },
 ];
 

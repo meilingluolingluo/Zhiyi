@@ -80,22 +80,34 @@ export function createSettingsRouter(options: SettingsRouterOptions): Router {
     res.json(upstream.reset());
   });
 
-  router.get('/v1/zhiyi/models', async (req: ExpressRequest, res: ExpressResponse): Promise<void> => {
+  const handleListModels = async (req: ExpressRequest, res: ExpressResponse): Promise<void> => {
     try {
-      const refresh: boolean = req.query.refresh === '1' || req.query.refresh === 'true';
-      const models = await upstream.listModels(refresh);
+      const body = req.method === 'POST' && req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+      const refresh: boolean =
+        req.query.refresh === '1' || req.query.refresh === 'true' || Boolean(body.refresh);
+      const override = req.method === 'POST' && (body.baseUrl || body.apiKey)
+        ? {
+            baseUrl: typeof body.baseUrl === 'string' ? body.baseUrl : undefined,
+            apiKey: typeof body.apiKey === 'string' ? body.apiKey : undefined,
+            modelsPath: typeof body.modelsPath === 'string' ? body.modelsPath : undefined,
+          }
+        : undefined;
+      const models = await upstream.listModels(refresh, override);
       const sources: string[] = upstream.modelSources();
       res.json({
         object: 'list',
         data: models,
-        source: upstream.view().effectiveBaseUrl,
+        source: override?.baseUrl ?? upstream.view().effectiveBaseUrl,
         sources,
         merged: sources.length > 1,
       });
     } catch (error) {
       fail(res, 502, error instanceof Error ? error.message : String(error), 'models_error');
     }
-  });
+  };
+
+  router.get('/v1/zhiyi/models', handleListModels);
+  router.post('/v1/zhiyi/models', handleListModels);
 
   router.post('/v1/zhiyi/settings/test', async (req: ExpressRequest, res: ExpressResponse): Promise<void> => {
     const withChat: boolean = Boolean((req.body as { chat?: unknown } | undefined)?.chat);

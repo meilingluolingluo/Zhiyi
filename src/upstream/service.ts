@@ -33,6 +33,7 @@ import {
   toPublicSettings,
   validateSettingsPatch,
   type ModelSettings,
+  type ModelsSource,
   type ProviderPreset,
   type PublicSettings,
   type SettingsPatch,
@@ -382,12 +383,18 @@ export class UpstreamService {
    * - /openapi/v2/available_models（Baidu 扩展信息，含 auto 等特殊模型与能力元数据）
    * 补充端点不存在时静默忽略，不影响主列表。
    */
-  async listModels(refresh = false): Promise<ModelInfo[]> {
-    if (!refresh && this.modelCache && Date.now() - this.modelCache.at < MODEL_CACHE_TTL_MS) {
+  async listModels(
+    refresh = false,
+    override?: { baseUrl?: string; apiKey?: string; modelsPath?: string; modelsSource?: ModelsSource },
+  ): Promise<ModelInfo[]> {
+    if (!refresh && !override && this.modelCache && Date.now() - this.modelCache.at < MODEL_CACHE_TTL_MS) {
       return this.modelCache.models;
     }
-    const current: ModelSettings = this.store.get();
-    const baseUrl: string = normalizeBaseUrl(current.baseUrl) || normalizeBaseUrl(this.config.upstreamBaseUrl);
+    const current: ModelSettings = override
+      ? { ...this.store.get(), ...override }
+      : this.store.get();
+    const baseUrl: string =
+      normalizeBaseUrl(current.baseUrl) || normalizeBaseUrl(this.config.upstreamBaseUrl);
     const primaryUrl: string = modelsUrl(baseUrl, current.modelsPath);
     const primarySource: ModelSource = primaryUrl.includes('/openapi/') ? 'baidu' : 'openai';
     const primary: ModelInfo[] = normalizeModels(
@@ -413,7 +420,9 @@ export class UpstreamService {
       }
     }
     const marked: ModelInfo[] = markVariants(models);
-    this.modelCache = { models: marked, at: Date.now(), sources };
+    if (!override) {
+      this.modelCache = { models: marked, at: Date.now(), sources };
+    }
     return marked;
   }
 

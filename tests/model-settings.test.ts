@@ -756,4 +756,27 @@ describe('设置 API（HTTP 集成）', () => {
       await h.close();
     }
   });
+
+  it('POST /v1/zhiyi/models 支持临时探测指定 baseUrl 与 apiKey 的可用模型列表', async () => {
+    const h = await start();
+    try {
+      const res = await fetch(`${h.baseUrl}/v1/zhiyi/models`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          baseUrl: 'https://override-endpoint.invalid/v1',
+          apiKey: 'override-key',
+          refresh: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.object).toBe('list');
+      expect(Array.isArray(json.data)).toBe(true);
+      expect(json.data.length).toBeGreaterThan(0);
+      expect(json.source).toBe('https://override-endpoint.invalid/v1');
+    } finally {
+      await h.close();
+    }
+  });
 });

@@ -118,6 +118,19 @@ body{
 .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
 @media (max-width:600px){.form-grid{grid-template-columns:1fr}}
 .col-span-2{grid-column:1 / -1}
+.field-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.field-header .field-label{margin-bottom:0}
+.btn-fetch-models{
+  display:inline-flex;align-items:center;gap:4px;background:transparent;border:none;
+  color:var(--accent);font-size:12px;font-weight:600;cursor:pointer;padding:2px 6px;border-radius:6px;
+  transition:all .15s var(--ease)
+}
+.btn-fetch-models:hover{background:var(--accent-soft);color:var(--accent-hover)}
+.btn-fetch-models:disabled{color:var(--muted);cursor:not-allowed;opacity:.7}
+.btn-fetch-models svg{transition:transform .3s var(--ease)}
+.btn-fetch-models.loading svg{animation:spin 1s linear infinite}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.model-picker-wrap{display:flex;flex-direction:column;gap:6px}
 .field-label{display:block;font-size:12.5px;font-weight:600;color:var(--ink-soft);margin-bottom:6px}
 .field-tip{font-size:11.5px;font-weight:400;color:var(--muted);margin-top:4px}
 .input-wrap{position:relative;display:flex;align-items:center}
@@ -304,9 +317,19 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
           </div>
 
           <div>
-            <label class="field-label" for="proxyModel">主模型 ID</label>
-            <input class="input mono" id="proxyModel" placeholder="例如 deepseek-chat 或 gpt-4o" autocomplete="off">
-            <div class="field-tip">指定上游服务的模型标识</div>
+            <div class="field-header">
+              <label class="field-label" for="proxyModel">主模型 ID</label>
+              <button type="button" class="btn-fetch-models" id="btnFetchProxyModels" title="从 API 拉取实时可用模型列表">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                <span>拉取模型列表</span>
+              </button>
+            </div>
+            <div class="model-picker-wrap">
+              <select class="select mono" id="proxyModelSelect" style="display:none"></select>
+              <input class="input mono" id="proxyModel" list="proxyModelDatalist" placeholder="例如 deepseek-chat 或 gpt-4o" autocomplete="off">
+              <datalist id="proxyModelDatalist"></datalist>
+            </div>
+            <div class="field-tip" id="proxyModelTip">指定上游服务的模型标识，可从下拉菜单点选或直接输入</div>
           </div>
         </div>
 
@@ -366,8 +389,18 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
             </div>
 
             <div>
-              <label class="field-label" for="memModel">Memory 抽取模型 ID</label>
-              <input class="input mono" id="memModel" placeholder="例如 deepseek-chat 或 gpt-4o-mini" autocomplete="off">
+              <div class="field-header">
+                <label class="field-label" for="memModel">Memory 抽取模型 ID</label>
+                <button type="button" class="btn-fetch-models" id="btnFetchMemModels" title="从 API 拉取实时可用模型列表">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                  <span>拉取模型列表</span>
+                </button>
+              </div>
+              <div class="model-picker-wrap">
+                <select class="select mono" id="memModelSelect" style="display:none"></select>
+                <input class="input mono" id="memModel" list="memModelDatalist" placeholder="例如 deepseek-chat 或 gpt-4o-mini" autocomplete="off">
+                <datalist id="memModelDatalist"></datalist>
+              </div>
               <div class="field-tip">推荐配置响应极速、性价比高的模型，加速后台记忆抽取</div>
             </div>
           </div>
@@ -575,12 +608,120 @@ client = OpenAI(
     }
   });
 
+  /* 填充模型下拉与 datalist 补全列表 */
+  function populateModelSelect(selectEl, datalistEl, models, currentVal) {
+    if (!selectEl || !datalistEl) return;
+    selectEl.innerHTML = '';
+    datalistEl.innerHTML = '';
+    if (!models || models.length === 0) {
+      selectEl.style.display = 'none';
+      return;
+    }
+    selectEl.style.display = 'block';
+    var defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = '▾ 从服务可用模型中点选 (' + models.length + ' 个)...';
+    selectEl.appendChild(defaultOpt);
+
+    var targetVal = currentVal || '';
+    models.forEach(function(m) {
+      var id = typeof m === 'string' ? m : m.id;
+      var name = typeof m === 'string' ? m : (m.name || m.id);
+      var tag = '';
+      if (m && typeof m === 'object') {
+        if (m.supportsThinking) tag = ' [推理]';
+        else if (m.supportsImage) tag = ' [生图]';
+      }
+      var opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = id + tag + (name && name !== id ? ' (' + name + ')' : '');
+      if (id === targetVal) opt.selected = true;
+      selectEl.appendChild(opt);
+
+      var dlOpt = document.createElement('option');
+      dlOpt.value = id;
+      datalistEl.appendChild(dlOpt);
+    });
+  }
+
+  /* 拉取上游可用模型列表 */
+  function fetchModels(forMemory) {
+    var btn = forMemory ? $('btnFetchMemModels') : $('btnFetchProxyModels');
+    var baseUrl = forMemory ? ($('memBaseUrl').value.trim() || $('proxyBaseUrl').value.trim()) : $('proxyBaseUrl').value.trim();
+    var apiKey = forMemory ? ($('memApiKey').value.trim() || $('proxyApiKey').value.trim()) : $('proxyApiKey').value.trim();
+    var tipEl = forMemory ? null : $('proxyModelTip');
+
+    if (!baseUrl) {
+      toast('请先填写 Base URL 接口地址', 'bad');
+      return;
+    }
+
+    btn.classList.add('loading');
+    btn.disabled = true;
+    var span = btn.querySelector('span');
+    var origText = span ? span.textContent : '拉取模型列表';
+    if (span) span.textContent = '正在拉取...';
+
+    api('/v1/zhiyi/models', 'POST', {
+      baseUrl: baseUrl,
+      apiKey: apiKey || undefined,
+      refresh: true,
+    }).then(function(res) {
+      var list = res.data || [];
+      if (list.length === 0) {
+        toast('未发现可用模型，请核对 API Key 与 Base URL', 'bad');
+        return;
+      }
+      toast('成功获取 ' + list.length + ' 个可用模型！');
+      if (tipEl) tipEl.textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，可直接在上方下拉选择';
+
+      populateModelSelect(
+        forMemory ? $('memModelSelect') : $('proxyModelSelect'),
+        forMemory ? $('memModelDatalist') : $('proxyModelDatalist'),
+        list,
+        forMemory ? $('memModel').value : $('proxyModel').value
+      );
+      if (!forMemory) {
+        populateModelSelect($('memModelSelect'), $('memModelDatalist'), list, $('memModel').value);
+      }
+    }).catch(function(err) {
+      toast('拉取模型失败: ' + err.message + '，可直接手动输入', 'bad');
+    }).finally(function() {
+      btn.classList.remove('loading');
+      btn.disabled = false;
+      if (span) span.textContent = origText;
+    });
+  }
+
+  $('btnFetchProxyModels').addEventListener('click', function(){ fetchModels(false); });
+  $('btnFetchMemModels').addEventListener('click', function(){ fetchModels(true); });
+
+  $('proxyModelSelect').addEventListener('change', function(){
+    if (this.value) {
+      $('proxyModel').value = this.value;
+      syncAllLinkages();
+    }
+  });
+
+  $('memModelSelect').addEventListener('change', function(){
+    if (this.value) {
+      $('memModel').value = this.value;
+      syncAllLinkages();
+    }
+  });
+
   /* 输入事件全链路联动 */
   $('proxyBaseUrl').addEventListener('input', syncAllLinkages);
-  $('proxyModel').addEventListener('input', syncAllLinkages);
+  $('proxyModel').addEventListener('input', function(){
+    if ($('proxyModelSelect')) $('proxyModelSelect').value = this.value;
+    syncAllLinkages();
+  });
   $('proxyProtocol').addEventListener('change', syncAllLinkages);
   $('memBaseUrl').addEventListener('input', syncAllLinkages);
-  $('memModel').addEventListener('input', syncAllLinkages);
+  $('memModel').addEventListener('input', function(){
+    if ($('memModelSelect')) $('memModelSelect').value = this.value;
+    syncAllLinkages();
+  });
   $('memProtocol').addEventListener('change', syncAllLinkages);
   $('memoryReuseProxy').addEventListener('change', syncAllLinkages);
 
@@ -596,6 +737,12 @@ client = OpenAI(
     setProxyAuth(found.authMode || 'api_key');
     if (found.upstreamProtocol) $('proxyProtocol').value = found.upstreamProtocol;
     if (found.defaultModel) $('proxyModel').value = found.defaultModel;
+
+    if (found.models && found.models.length > 0) {
+      populateModelSelect($('proxyModelSelect'), $('proxyModelDatalist'), found.models, found.defaultModel);
+      populateModelSelect($('memModelSelect'), $('memModelDatalist'), found.models, found.defaultModel);
+      $('proxyModelTip').textContent = '✓ 已预置常用模型，点击右上角「拉取模型列表」可获取该服务实时模型';
+    }
 
     // 若当前未复用且记忆字段为空，自动填充对应默认值
     if (!$('memoryReuseProxy').checked && !$('memModel').value.trim()) {
@@ -645,6 +792,14 @@ client = OpenAI(
       if ($('ducxExecutable') && data.ducxExecutable) $('ducxExecutable').value = data.ducxExecutable;
 
       updateStatus(data);
+      api('/v1/zhiyi/models').then(function(res){
+        var list = res.data || [];
+        if (list.length > 0) {
+          populateModelSelect($('proxyModelSelect'), $('proxyModelDatalist'), list, $('proxyModel').value);
+          populateModelSelect($('memModelSelect'), $('memModelDatalist'), list, $('memModel').value);
+          $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，可直接下拉选择';
+        }
+      }).catch(function(){});
     }).catch(function(err){
       toast('读取配置失败: ' + err.message, 'bad');
     });
@@ -745,6 +900,16 @@ client = OpenAI(
 
         if (withChat && res.chat) {
           bubble.innerHTML = '<b>助手真实回复回显：</b>' + escapeHtml(res.chat);
+        }
+        if (res.modelCount) {
+          api('/v1/zhiyi/models').then(function(mRes){
+            var list = mRes.data || [];
+            if (list.length > 0) {
+              populateModelSelect($('proxyModelSelect'), $('proxyModelDatalist'), list, $('proxyModel').value);
+              populateModelSelect($('memModelSelect'), $('memModelDatalist'), list, $('memModel').value);
+              $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，可直接下拉选择';
+            }
+          }).catch(function(){});
         }
         toast('LLM 通路测试通过！');
       } else {
