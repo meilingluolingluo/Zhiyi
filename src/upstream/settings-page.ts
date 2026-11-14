@@ -318,18 +318,17 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
 
           <div>
             <div class="field-header">
-              <label class="field-label" for="proxyModel">主模型 ID</label>
+              <label class="field-label" for="proxyModelSelect">主模型 ID</label>
               <button type="button" class="btn-fetch-models" id="btnFetchProxyModels" title="从 API 拉取实时可用模型列表">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
                 <span>拉取模型列表</span>
               </button>
             </div>
             <div class="model-picker-wrap">
-              <select class="select mono" id="proxyModelSelect" style="display:none"></select>
-              <input class="input mono" id="proxyModel" list="proxyModelDatalist" placeholder="例如 deepseek-chat 或 gpt-4o" autocomplete="off">
-              <datalist id="proxyModelDatalist"></datalist>
+              <select class="select mono" id="proxyModelSelect"></select>
+              <input class="input mono" id="proxyModel" placeholder="请输入自定义模型 ID，例如 deepseek-chat" autocomplete="off" style="display:none">
             </div>
-            <div class="field-tip" id="proxyModelTip">指定上游服务的模型标识，可从下拉菜单点选或直接输入</div>
+            <div class="field-tip" id="proxyModelTip">选择上游服务的模型标识</div>
           </div>
         </div>
 
@@ -390,18 +389,17 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
 
             <div>
               <div class="field-header">
-                <label class="field-label" for="memModel">Memory 抽取模型 ID</label>
+                <label class="field-label" for="memModelSelect">Memory 抽取模型 ID</label>
                 <button type="button" class="btn-fetch-models" id="btnFetchMemModels" title="从 API 拉取实时可用模型列表">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
                   <span>拉取模型列表</span>
                 </button>
               </div>
               <div class="model-picker-wrap">
-                <select class="select mono" id="memModelSelect" style="display:none"></select>
-                <input class="input mono" id="memModel" list="memModelDatalist" placeholder="例如 deepseek-chat 或 gpt-4o-mini" autocomplete="off">
-                <datalist id="memModelDatalist"></datalist>
+                <select class="select mono" id="memModelSelect"></select>
+                <input class="input mono" id="memModel" placeholder="请输入自定义模型 ID，例如 deepseek-chat" autocomplete="off" style="display:none">
               </div>
-              <div class="field-tip">推荐配置响应极速、性价比高的模型，加速后台记忆抽取</div>
+              <div class="field-tip" id="memModelTip">推荐配置响应极速、性价比高的模型，加速后台记忆抽取</div>
             </div>
           </div>
         </div>
@@ -608,24 +606,22 @@ client = OpenAI(
     }
   });
 
-  /* 填充模型下拉与 datalist 补全列表 */
-  function populateModelSelect(selectEl, datalistEl, models, currentVal) {
-    if (!selectEl || !datalistEl) return;
+  /* 填充模型下拉列表（保留选择框，默认选中列表首个模型，支持手动输入） */
+  function populateModelSelect(selectEl, inputEl, models, currentVal) {
+    if (!selectEl || !inputEl) return;
     selectEl.innerHTML = '';
-    datalistEl.innerHTML = '';
     if (!models || models.length === 0) {
       selectEl.style.display = 'none';
+      inputEl.style.display = 'block';
       return;
     }
-    selectEl.style.display = 'block';
-    var defaultOpt = document.createElement('option');
-    defaultOpt.value = '';
-    defaultOpt.textContent = '▾ 从服务可用模型中点选 (' + models.length + ' 个)...';
-    selectEl.appendChild(defaultOpt);
 
-    var targetVal = currentVal || '';
-    models.forEach(function(m) {
+    selectEl.style.display = 'block';
+    var firstModelId = '';
+
+    models.forEach(function(m, idx) {
       var id = typeof m === 'string' ? m : m.id;
+      if (idx === 0) firstModelId = id;
       var name = typeof m === 'string' ? m : (m.name || m.id);
       var tag = '';
       if (m && typeof m === 'object') {
@@ -635,13 +631,45 @@ client = OpenAI(
       var opt = document.createElement('option');
       opt.value = id;
       opt.textContent = id + tag + (name && name !== id ? ' (' + name + ')' : '');
-      if (id === targetVal) opt.selected = true;
       selectEl.appendChild(opt);
-
-      var dlOpt = document.createElement('option');
-      dlOpt.value = id;
-      datalistEl.appendChild(dlOpt);
     });
+
+    var customOpt = document.createElement('option');
+    customOpt.value = '__custom__';
+    customOpt.textContent = '✏️ 手动输入其它自定义模型...';
+    selectEl.appendChild(customOpt);
+
+    // 选中逻辑：已有值且在列表中则保留，否则默认设置返回列表的第一个模型
+    var selectedId = '';
+    if (currentVal && currentVal !== '__custom__') {
+      for (var i = 0; i < selectEl.options.length; i++) {
+        if (selectEl.options[i].value === currentVal) {
+          selectEl.selectedIndex = i;
+          selectedId = currentVal;
+          break;
+        }
+      }
+    }
+
+    if (!selectedId) {
+      if (firstModelId) {
+        selectEl.value = firstModelId;
+        selectedId = firstModelId;
+      } else {
+        selectEl.value = '__custom__';
+        selectedId = '__custom__';
+      }
+    }
+
+    if (selectEl.value === '__custom__') {
+      inputEl.style.display = 'block';
+      inputEl.value = currentVal && currentVal !== '__custom__' ? currentVal : '';
+    } else {
+      inputEl.style.display = 'none';
+      inputEl.value = selectEl.value;
+    }
+
+    syncAllLinkages();
   }
 
   /* 拉取上游可用模型列表 */
@@ -649,7 +677,7 @@ client = OpenAI(
     var btn = forMemory ? $('btnFetchMemModels') : $('btnFetchProxyModels');
     var baseUrl = forMemory ? ($('memBaseUrl').value.trim() || $('proxyBaseUrl').value.trim()) : $('proxyBaseUrl').value.trim();
     var apiKey = forMemory ? ($('memApiKey').value.trim() || $('proxyApiKey').value.trim()) : $('proxyApiKey').value.trim();
-    var tipEl = forMemory ? null : $('proxyModelTip');
+    var tipEl = forMemory ? $('memModelTip') : $('proxyModelTip');
 
     if (!baseUrl) {
       toast('请先填写 Base URL 接口地址', 'bad');
@@ -673,16 +701,16 @@ client = OpenAI(
         return;
       }
       toast('成功获取 ' + list.length + ' 个可用模型！');
-      if (tipEl) tipEl.textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，可直接在上方下拉选择';
+      if (tipEl) tipEl.textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，已默认选择首个模型';
 
       populateModelSelect(
         forMemory ? $('memModelSelect') : $('proxyModelSelect'),
-        forMemory ? $('memModelDatalist') : $('proxyModelDatalist'),
+        forMemory ? $('memModel') : $('proxyModel'),
         list,
         forMemory ? $('memModel').value : $('proxyModel').value
       );
       if (!forMemory) {
-        populateModelSelect($('memModelSelect'), $('memModelDatalist'), list, $('memModel').value);
+        populateModelSelect($('memModelSelect'), $('memModel'), list, $('memModel').value);
       }
     }).catch(function(err) {
       toast('拉取模型失败: ' + err.message + '，可直接手动输入', 'bad');
@@ -697,31 +725,35 @@ client = OpenAI(
   $('btnFetchMemModels').addEventListener('click', function(){ fetchModels(true); });
 
   $('proxyModelSelect').addEventListener('change', function(){
-    if (this.value) {
+    if (this.value === '__custom__') {
+      $('proxyModel').style.display = 'block';
+      $('proxyModel').value = '';
+      $('proxyModel').focus();
+    } else {
+      $('proxyModel').style.display = 'none';
       $('proxyModel').value = this.value;
-      syncAllLinkages();
     }
+    syncAllLinkages();
   });
 
   $('memModelSelect').addEventListener('change', function(){
-    if (this.value) {
+    if (this.value === '__custom__') {
+      $('memModel').style.display = 'block';
+      $('memModel').value = '';
+      $('memModel').focus();
+    } else {
+      $('memModel').style.display = 'none';
       $('memModel').value = this.value;
-      syncAllLinkages();
     }
+    syncAllLinkages();
   });
 
   /* 输入事件全链路联动 */
   $('proxyBaseUrl').addEventListener('input', syncAllLinkages);
-  $('proxyModel').addEventListener('input', function(){
-    if ($('proxyModelSelect')) $('proxyModelSelect').value = this.value;
-    syncAllLinkages();
-  });
+  $('proxyModel').addEventListener('input', syncAllLinkages);
   $('proxyProtocol').addEventListener('change', syncAllLinkages);
   $('memBaseUrl').addEventListener('input', syncAllLinkages);
-  $('memModel').addEventListener('input', function(){
-    if ($('memModelSelect')) $('memModelSelect').value = this.value;
-    syncAllLinkages();
-  });
+  $('memModel').addEventListener('input', syncAllLinkages);
   $('memProtocol').addEventListener('change', syncAllLinkages);
   $('memoryReuseProxy').addEventListener('change', syncAllLinkages);
 
@@ -739,8 +771,8 @@ client = OpenAI(
     if (found.defaultModel) $('proxyModel').value = found.defaultModel;
 
     if (found.models && found.models.length > 0) {
-      populateModelSelect($('proxyModelSelect'), $('proxyModelDatalist'), found.models, found.defaultModel);
-      populateModelSelect($('memModelSelect'), $('memModelDatalist'), found.models, found.defaultModel);
+      populateModelSelect($('proxyModelSelect'), $('proxyModel'), found.models, found.defaultModel);
+      populateModelSelect($('memModelSelect'), $('memModel'), found.models, found.defaultModel);
       $('proxyModelTip').textContent = '✓ 已预置常用模型，点击右上角「拉取模型列表」可获取该服务实时模型';
     }
 
@@ -795,9 +827,9 @@ client = OpenAI(
       api('/v1/zhiyi/models').then(function(res){
         var list = res.data || [];
         if (list.length > 0) {
-          populateModelSelect($('proxyModelSelect'), $('proxyModelDatalist'), list, $('proxyModel').value);
-          populateModelSelect($('memModelSelect'), $('memModelDatalist'), list, $('memModel').value);
-          $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，可直接下拉选择';
+          populateModelSelect($('proxyModelSelect'), $('proxyModel'), list, $('proxyModel').value);
+          populateModelSelect($('memModelSelect'), $('memModel'), list, $('memModel').value);
+          $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，已默认选择首个模型';
         }
       }).catch(function(){});
     }).catch(function(err){
@@ -905,9 +937,9 @@ client = OpenAI(
           api('/v1/zhiyi/models').then(function(mRes){
             var list = mRes.data || [];
             if (list.length > 0) {
-              populateModelSelect($('proxyModelSelect'), $('proxyModelDatalist'), list, $('proxyModel').value);
-              populateModelSelect($('memModelSelect'), $('memModelDatalist'), list, $('memModel').value);
-              $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，可直接下拉选择';
+              populateModelSelect($('proxyModelSelect'), $('proxyModel'), list, $('proxyModel').value);
+              populateModelSelect($('memModelSelect'), $('memModel'), list, $('memModel').value);
+              $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，已默认选择首个模型';
             }
           }).catch(function(){});
         }
