@@ -32,6 +32,15 @@ import {
 } from './upstream/media-handlers';
 import { isValidImageFilename } from './upstream/media-store';
 import {
+  executeWebFetch,
+  executeWebSearch,
+  validateFetchParams,
+  validateSearchParams,
+  WebToolError,
+  type WebFetchResult,
+  type WebSearchResult,
+} from './upstream/web-search';
+import {
   MEMORY_CATEGORIES,
   MEMORY_SCOPES,
   MEMORY_STATUSES,
@@ -606,6 +615,111 @@ export function createRouter(deps: AppDeps): Router {
 
   router.post('/v1/chat/completions', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
     void handleChatCompletion(req, res, deps).catch(next);
+  });
+
+  // ===== DeepSeek 兼容 Tools（Search & Fetch） =====
+  const extractAuthBearer = (req: ExpressRequest): string | undefined => {
+    const auth = req.headers.authorization;
+    if (typeof auth === 'string') {
+      const match = auth.match(/^Bearer\s+(.+)$/i);
+      if (match && match[1]) return match[1].trim();
+    }
+    return undefined;
+  };
+
+  const handleWebSearch = async (req: ExpressRequest, res: ExpressResponse, next: NextFunction): Promise<void> => {
+    const controller = new AbortController();
+    req.on('close', () => {
+      if (!res.writableEnded) controller.abort();
+    });
+    try {
+      const apiKeyOverride = extractAuthBearer(req);
+      let result: WebSearchResult;
+      if (deps.upstream) {
+        result = await deps.upstream.searchWeb(req.body, {
+          signal: controller.signal,
+          apiKeyOverride,
+        });
+      } else {
+        const validated = validateSearchParams(req.body);
+        const apiKey = apiKeyOverride || deps.config.upstreamApiKey;
+        result = await executeWebSearch(deps.transport, {
+          baseUrl: deps.config.upstreamBaseUrl,
+          apiKey,
+          params: validated,
+          mockUpstream: deps.config.mockUpstream,
+          signal: controller.signal,
+        });
+      }
+      res.json(result);
+    } catch (err) {
+      if (err instanceof WebToolError) {
+        res.status(err.status).json({
+          error: {
+            message: err.message,
+            type: 'invalid_request_error',
+            param: null,
+            code: err.code,
+          },
+        });
+        return;
+      }
+      next(err);
+    }
+  };
+
+  const handleWebFetch = async (req: ExpressRequest, res: ExpressResponse, next: NextFunction): Promise<void> => {
+    const controller = new AbortController();
+    req.on('close', () => {
+      if (!res.writableEnded) controller.abort();
+    });
+    try {
+      const apiKeyOverride = extractAuthBearer(req);
+      let result: WebFetchResult;
+      if (deps.upstream) {
+        result = await deps.upstream.fetchWeb(req.body, {
+          signal: controller.signal,
+          apiKeyOverride,
+        });
+      } else {
+        const validated = validateFetchParams(req.body);
+        const apiKey = apiKeyOverride || deps.config.upstreamApiKey;
+        result = await executeWebFetch(deps.transport, {
+          baseUrl: deps.config.upstreamBaseUrl,
+          apiKey,
+          params: validated,
+          mockUpstream: deps.config.mockUpstream,
+          signal: controller.signal,
+        });
+      }
+      res.json(result);
+    } catch (err) {
+      if (err instanceof WebToolError) {
+        res.status(err.status).json({
+          error: {
+            message: err.message,
+            type: 'invalid_request_error',
+            param: null,
+            code: err.code,
+          },
+        });
+        return;
+      }
+      next(err);
+    }
+  };
+
+  router.post('/v1/tools/search', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+    void handleWebSearch(req, res, next);
+  });
+  router.post('/tools/search', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+    void handleWebSearch(req, res, next);
+  });
+  router.post('/v1/tools/fetch', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+    void handleWebFetch(req, res, next);
+  });
+  router.post('/tools/fetch', (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+    void handleWebFetch(req, res, next);
   });
 
   // ===== 仅 Mock 模式开放的调试端点 =====

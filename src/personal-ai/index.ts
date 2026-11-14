@@ -25,6 +25,12 @@ import { ZhiyiToolGateway } from './runtime/openclaw/tool-gateway';
 import { PersonalAIRuntime } from './runtime/personal-ai-runtime';
 import { createPersonalAIRouter } from './routes';
 import { executeImageGeneration } from '../upstream/media-handlers';
+import {
+  executeWebFetch,
+  executeWebSearch,
+  validateFetchParams,
+  validateSearchParams,
+} from '../upstream/web-search';
 import { BusinessTaskManager } from './task/business-task-manager';
 import { BusinessTaskRepository } from './task/business-task-repository';
 import { ExecutionEventStore } from './task/execution-event-store';
@@ -234,6 +240,26 @@ export function createPersonalAI(
         body,
         options,
       ),
+    searchWeb: (params, options) =>
+      base.upstream
+        ? base.upstream.searchWeb(params, options)
+        : executeWebSearch(base.transport, {
+            baseUrl: base.config.upstreamBaseUrl,
+            apiKey: base.config.upstreamApiKey,
+            params: validateSearchParams(params),
+            mockUpstream: base.config.mockUpstream,
+            signal: options?.signal,
+          }),
+    fetchWeb: (params, options) =>
+      base.upstream
+        ? base.upstream.fetchWeb(params, options)
+        : executeWebFetch(base.transport, {
+            baseUrl: base.config.upstreamBaseUrl,
+            apiKey: base.config.upstreamApiKey,
+            params: validateFetchParams(params),
+            mockUpstream: base.config.mockUpstream,
+            signal: options?.signal,
+          }),
   });
 
   const openClawRunner: OpenClawAgentRunner = new OpenClawAgentRunner({

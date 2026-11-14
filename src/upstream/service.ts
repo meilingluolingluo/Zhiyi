@@ -38,6 +38,14 @@ import {
   type SettingsPatch,
   normalizeBaseUrl,
 } from './model-settings';
+import {
+  executeWebFetch,
+  executeWebSearch,
+  validateFetchParams,
+  validateSearchParams,
+  type WebFetchResult,
+  type WebSearchResult,
+} from './web-search';
 
 export interface ResolvedUpstream {
   baseUrl: string;
@@ -676,6 +684,56 @@ export class UpstreamService {
     } catch {
       return { title: fallbackTitle, model: targetModel, fallback: true };
     }
+  }
+
+  /** 执行网络搜索请求（兼容 DeepSeek Tools Search 协议）。 */
+  async searchWeb(
+    params: unknown,
+    options: { signal?: AbortSignal; apiKeyOverride?: string } = {},
+  ): Promise<WebSearchResult> {
+    const validated = validateSearchParams(params);
+    const resolved = await this.resolveForRequest();
+    const baseUrl =
+      resolved?.baseUrl ||
+      this.store.get().baseUrl ||
+      this.config.upstreamBaseUrl ||
+      'https://api.deepseek.com/v1';
+    const apiKey =
+      (options.apiKeyOverride && options.apiKeyOverride.trim()) ||
+      this.store.get().apiKey ||
+      this.config.upstreamApiKey;
+    return executeWebSearch(this.transport, {
+      baseUrl,
+      apiKey,
+      params: validated,
+      mockUpstream: this.config.mockUpstream,
+      signal: options.signal,
+    });
+  }
+
+  /** 执行网页抓取请求（兼容 DeepSeek Tools Fetch 协议）。 */
+  async fetchWeb(
+    params: unknown,
+    options: { signal?: AbortSignal; apiKeyOverride?: string } = {},
+  ): Promise<WebFetchResult> {
+    const validated = validateFetchParams(params);
+    const resolved = await this.resolveForRequest();
+    const baseUrl =
+      resolved?.baseUrl ||
+      this.store.get().baseUrl ||
+      this.config.upstreamBaseUrl ||
+      'https://api.deepseek.com/v1';
+    const apiKey =
+      (options.apiKeyOverride && options.apiKeyOverride.trim()) ||
+      this.store.get().apiKey ||
+      this.config.upstreamApiKey;
+    return executeWebFetch(this.transport, {
+      baseUrl,
+      apiKey,
+      params: validated,
+      mockUpstream: this.config.mockUpstream,
+      signal: options.signal,
+    });
   }
 
   async testConnection(withChat: boolean): Promise<TestResult> {

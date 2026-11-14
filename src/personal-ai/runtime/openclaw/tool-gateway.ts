@@ -27,6 +27,7 @@ import {
   type MemoryType,
 } from '../../../types';
 import type { ImageGenerationResult } from '../../../upstream/service';
+import type { WebFetchResult, WebSearchResult } from '../../../upstream/web-search';
 import { DomainError } from '../../domain/types';
 import type { GoalStore } from '../../domain/goal-store';
 import type { ProjectStore } from '../../domain/project-store';
@@ -81,6 +82,8 @@ export const DEFAULT_SAFE_OPENCLAW_TOOLS: readonly string[] = [
   'task_create',
   'task_update',
   'image_generate',
+  'web_search',
+  'web_fetch',
 ];
 
 const SECRET_VALUE_PATTERN =
@@ -122,6 +125,16 @@ export interface ZhiyiToolGatewayDeps {
     body: Record<string, unknown>,
     options?: { signal?: AbortSignal; publicOrigin?: string },
   ) => Promise<ImageGenerationResult>;
+  /** 网络搜索执行函数（经知忆统一搜索链路，兼容 DeepSeek Tools 协议）。 */
+  searchWeb?: (
+    params: unknown,
+    options?: { signal?: AbortSignal },
+  ) => Promise<WebSearchResult>;
+  /** 网页抓取执行函数（经知忆统一抓取链路，兼容 DeepSeek Tools 协议）。 */
+  fetchWeb?: (
+    params: unknown,
+    options?: { signal?: AbortSignal },
+  ) => Promise<WebFetchResult>;
   /** 扩展工具注入（仍受 allowlist 与 PolicyChecker 约束）。 */
   extraTools?: ZhiyiToolDefinition[];
 }
@@ -1167,6 +1180,59 @@ export class ZhiyiToolGateway {
         return {
           text: `已使用模型 ${res.model} 生成 ${res.savedUrls.length} 张图片，请在最终回复中原样包含以下 Markdown 图片：\n\n${markdown}`,
           details: { model: res.model, urls: res.savedUrls },
+        };
+      },
+    });
+
+    this.registerTool({
+      name: 'web_search',
+      label: '实时网页搜索',
+      description: '按 query 实时搜索互联网并返回权威结果、结构化摘要与正文（兼容 DeepSeek Tools 协议）。',
+      parameters: Type.Object(
+        {
+          query: Type.String({ minLength: 1, maxLength: 128, description: '搜索关键词，支持 site:、-、"..."、lang: 等语法' }),
+          count: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: '返回条数（1～50，默认 10）' })),
+          need_content: Type.Optional(Type.Boolean({ description: '是否在 content 中返回网页正文（默认 false）' })),
+        },
+        { additionalProperties: false },
+      ),
+      execute: async (_ctx, params, signal) => {
+        if (!this.deps.searchWeb) {
+          throw new Error('当前网关未配置网络搜索能力');
+        }
+        const res = await this.deps.searchWeb(params, { signal });
+        if (!res.results || res.results.length === 0) {
+          return { text: '未检索到相关网页结果。', details: { query: params.query, count: 0, results: [] } };
+        }
+        const lines = res.results.map(
+          (item, idx) =>
+            `${idx + 1}. [${item.title}](${item.url})\n   摘要: ${item.summary || item.snippet}${item.site_name ? ` (${item.site_name})` : ''}`,
+        );
+        return {
+          text: `检索到 ${res.results.length} 条相关结果：\n\n${lines.join('\n\n')}`,
+          details: res,
+        };
+      },
+    });
+
+    this.registerTool({
+      name: 'web_fetch',
+      label: '抓取网页正文',
+      description: '抓取指定 HTTP/HTTPS 网页内容并以 Markdown 文本返回页面正文。',
+      parameters: Type.Object(
+        {
+          url: Type.String({ minLength: 1, maxLength: 8192, description: '要抓取的网页有效 HTTP/HTTPS 地址' }),
+        },
+        { additionalProperties: false },
+      ),
+      execute: async (_ctx, params, signal) => {
+        if (!this.deps.fetchWeb) {
+          throw new Error('当前网关未配置网页抓取能力');
+        }
+        const res = await this.deps.fetchWeb(params, { signal });
+        return {
+          text: `# ${res.title || '网页正文'}\n\n${res.content}`,
+          details: res,
         };
       },
     });

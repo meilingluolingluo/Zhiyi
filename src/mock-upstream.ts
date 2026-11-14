@@ -232,12 +232,43 @@ export class MockUpstream {
   /** 供 Gateway 注入的 transport：不经过网络，但完全复用 fetch/Response 语义。 */
   createTransport(): UpstreamTransport {
     return async (url: string, init: RequestInit): Promise<Response> => {
-      void url;
       let parsed: Record<string, unknown> = {};
       try {
         parsed = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
       } catch {
         parsed = {};
+      }
+      if (url.includes('/tools/search')) {
+        const query = typeof parsed.query === 'string' ? parsed.query : 'test';
+        const count = typeof parsed.count === 'number' ? parsed.count : 5;
+        const needContent = Boolean(parsed.need_content);
+        return new Response(
+          JSON.stringify({
+            results: Array.from({ length: Math.min(count, 5) }).map((_, idx) => ({
+              rerank_score: +(2.5 - idx * 0.3).toFixed(2),
+              title: `${query} 搜索结果 #${idx + 1}`,
+              url: `https://example.com/result/${idx + 1}`,
+              snippet: `关于 ${query} 的网页摘要 #${idx + 1}`,
+              summary: `深度总结：${query} 的要点内容 #${idx + 1}`,
+              content: needContent ? `# ${query} 正文内容 #${idx + 1}` : '',
+              site_name: 'Example News',
+              site_icon: 'https://example.com/favicon.ico',
+              date: new Date().toISOString(),
+              authority: 3,
+            })),
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.includes('/tools/fetch')) {
+        const targetUrl = typeof parsed.url === 'string' ? parsed.url : 'https://example.com';
+        return new Response(
+          JSON.stringify({
+            title: `页面抓取 - ${targetUrl}`,
+            content: `# 抓取结果\n\n正文内容来自 ${targetUrl}`,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
       }
       return this.handle(parsed, init.signal ?? undefined);
     };
