@@ -167,3 +167,88 @@ describe('场景三：不同 user_id 严格隔离', () => {
     expect(u1List.json.items.some((m: { content: string }) => m.content.includes('u2 的私有偏好'))).toBe(false);
   });
 });
+
+describe('场景四：记忆证据链与写入路径约束', () => {
+  it('POST /v1/memories 支持可选传入 evidence_trajectory_ids，缺省为 []', async (): Promise<void> => {
+    const defaultRes = await h.api('/v1/memories', {
+      method: 'POST',
+      body: { content: '默认无证据链记忆条目' },
+    });
+    expect(defaultRes.status).toBe(201);
+    expect(defaultRes.json.memory.evidence_trajectory_ids).toEqual([]);
+
+    const withEvidence = await h.api('/v1/memories', {
+      method: 'POST',
+      body: {
+        content: '带明确证据链的持久记忆条目',
+        evidence_trajectory_ids: ['traj_1', 'traj_2'],
+      },
+    });
+    expect(withEvidence.status).toBe(201);
+    expect(withEvidence.json.memory.evidence_trajectory_ids).toEqual(['traj_1', 'traj_2']);
+
+    const fetched = await h.api(`/v1/memories/${withEvidence.json.memory.memory_id}`);
+    expect(fetched.status).toBe(200);
+    expect(fetched.json.memory.evidence_trajectory_ids).toEqual(['traj_1', 'traj_2']);
+  });
+
+  it('approve candidate 时正确继承 trajectory_id 与已有 evidence，未 approve 的候选不进入检索与注入', async (): Promise<void> => {
+    // 1. 创建带有 trajectory_id 与已有 evidence 的候选
+    const createdCand = h.deps.candidateStore.create(
+      {
+        user_id: 'u1',
+        content: '候选记忆：仅在 approve 后可见的长期规范条目',
+        type: 'semantic',
+        scope: 'personal',
+        confidence: 0.88,
+        trajectory_id: 'traj_source_1',
+        evidence_trajectory_ids: ['traj_prior_evidence'],
+        status: 'pending',
+      },
+      h.deps.memoryStore,
+    );
+    expect(createdCand.created).toBe(true);
+    const candId = createdCand.candidate!.id;
+
+    // 2. 未 approve 的候选不出现在 GET /v1/memories
+    const listBefore = await h.api('/v1/memories');
+    expect(listBefore.json.items.some((m: any) => m.content.includes('仅在 approve 后可见'))).toBe(false);
+
+    // 3. 未 approve 的候选不进入 POST /v1/memories/search
+    const searchBefore = await h.api('/v1/memories/search', {
+      method: 'POST',
+      body: { query: '长期规范条目' },
+    });
+    expect(searchBefore.json.results.some((r: any) => r.memory.content.includes('仅在 approve 后可见'))).toBe(false);
+
+    // 4. 未 approve 的候选不进入 ContextBuilder / buildMemoryContext 注入
+    const proxyCheck = await h.api('/v1/chat/completions', {
+      method: 'POST',
+      body: { messages: [{ role: 'user', content: '请问我们有什么长期规范条目？' }] },
+    });
+    expect(proxyCheck.status).toBe(200);
+
+    // 5. 执行 approve
+    const approvedRes = await h.api(`/v1/memory-candidates/${candId}/approve`, {
+      method: 'POST',
+      body: {},
+    });
+    expect(approvedRes.status).toBe(200);
+    expect(approvedRes.json.ok).toBe(true);
+    const approvedMem = approvedRes.json.memory;
+    expect(approvedMem.source).toBe(`candidate:${candId}`);
+    expect(approvedMem.evidence_trajectory_ids).toEqual(
+      expect.arrayContaining(['traj_source_1', 'traj_prior_evidence']),
+    );
+
+    // 6. approve 后能够正常被 GET 与检索命中
+    const listAfter = await h.api('/v1/memories');
+    expect(listAfter.json.items.some((m: any) => m.memory_id === approvedMem.memory_id)).toBe(true);
+
+    const searchAfter = await h.api('/v1/memories/search', {
+      method: 'POST',
+      body: { query: '长期规范条目' },
+    });
+    expect(searchAfter.json.results.some((r: any) => r.memory.memory_id === approvedMem.memory_id)).toBe(true);
+  });
+});

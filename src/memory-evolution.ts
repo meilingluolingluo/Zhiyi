@@ -206,8 +206,12 @@ export function evolveMemoryWriteInTx(
       1,
       Math.max(duplicate.confidence, input.confidence ?? duplicate.confidence) + 0.05,
     );
+    const existingEvidences = duplicate.evidence_trajectory_ids ?? [];
+    const newEvidences = input.evidence_trajectory_ids ?? [];
+    const mergedEvidences = Array.from(new Set([...existingEvidences, ...newEvidences]));
     const updated = store.update(input.user_id, duplicate.memory_id, {
       confidence: nextConfidence,
+      evidence_trajectory_ids: mergedEvidences,
       project_id: duplicate.project_id ?? input.project_id ?? null,
       goal_id: duplicate.goal_id ?? input.goal_id ?? null,
       task_id: duplicate.task_id ?? input.task_id ?? null,
@@ -321,6 +325,7 @@ export function correctMemory(
       content: correction.content.trim(),
       source: 'user-correction',
       confidence: 1,
+      evidence_trajectory_ids: existing.evidence_trajectory_ids,
       verified_by_user: true,
       expires_at:
         correction.expires_at !== undefined ? correction.expires_at : existing.expires_at,

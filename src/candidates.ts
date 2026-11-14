@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { Database } from './db';
 import { normalizeContent } from './extraction-rules';
-import { normalizeMemoryCategory, type MemoryStore } from './memories';
+import { normalizeMemoryCategory, parseEvidenceTrajectoryIds, type MemoryStore } from './memories';
 import {
   evolveMemoryWriteInTx,
   findConflictingMemory,
@@ -32,6 +32,7 @@ export interface NewCandidate {
   content: string;
   source?: string;
   trajectory_id?: string | null;
+  evidence_trajectory_ids?: string[];
   confidence: number;
   status?: CandidateStatus;
 }
@@ -63,7 +64,7 @@ function normalizeScope(value: unknown): MemoryScope {
   return MEMORY_SCOPES.includes(value as MemoryScope) ? (value as MemoryScope) : 'personal';
 }
 
-function rowToCandidate(row: MemoryCandidate): MemoryCandidate {
+function rowToCandidate(row: MemoryCandidate & { evidence_trajectory_ids?: string | string[] }): MemoryCandidate {
   return {
     ...row,
     agent_id: row.agent_id ?? null,
@@ -72,6 +73,7 @@ function rowToCandidate(row: MemoryCandidate): MemoryCandidate {
     task_id: row.task_id ?? null,
     category: normalizeMemoryCategory(row.category),
     trajectory_id: row.trajectory_id ?? null,
+    evidence_trajectory_ids: parseEvidenceTrajectoryIds(row.evidence_trajectory_ids),
     conflict_memory_id: row.conflict_memory_id ?? null,
     created_memory_id: row.created_memory_id ?? null,
     confidence: Number(row.confidence),
@@ -123,6 +125,17 @@ export class CandidateStore {
       },
       memoryStore.allForUser(input.user_id, false),
     );
+    const evidenceIds: string[] = [];
+    if (input.trajectory_id && input.trajectory_id.trim() !== '') {
+      evidenceIds.push(input.trajectory_id.trim());
+    }
+    if (Array.isArray(input.evidence_trajectory_ids)) {
+      for (const id of input.evidence_trajectory_ids) {
+        if (typeof id === 'string' && id.trim() !== '' && !evidenceIds.includes(id.trim())) {
+          evidenceIds.push(id.trim());
+        }
+      }
+    }
     const candidate: MemoryCandidate = {
       id: `cand_${randomUUID()}`,
       user_id: input.user_id,
@@ -136,6 +149,7 @@ export class CandidateStore {
       content: input.content,
       source: input.source ?? 'auto-extract',
       trajectory_id: input.trajectory_id ?? null,
+      evidence_trajectory_ids: evidenceIds,
       conflict_memory_id: conflict?.memory.memory_id ?? null,
       confidence: Math.min(1, Math.max(0, Number(input.confidence) || 0)),
       status: input.status ?? 'pending',
@@ -146,8 +160,8 @@ export class CandidateStore {
     this.db.run(
       `INSERT INTO memory_candidates
        (id, user_id, agent_id, project_id, goal_id, task_id, type, scope, category, content, source,
-        trajectory_id, conflict_memory_id, confidence, status, created_memory_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        trajectory_id, evidence_trajectory_ids, conflict_memory_id, confidence, status, created_memory_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
       [
         candidate.id,
         candidate.user_id,
@@ -161,6 +175,7 @@ export class CandidateStore {
         candidate.content,
         candidate.source,
         candidate.trajectory_id,
+        JSON.stringify(candidate.evidence_trajectory_ids ?? []),
         candidate.conflict_memory_id,
         candidate.confidence,
         candidate.status,
@@ -214,6 +229,18 @@ export class CandidateStore {
         return { ok: false, idempotent: false, reason: 'rejected', candidate };
       }
 
+      const evidenceTrajectoryIds: string[] = [];
+      if (candidate.trajectory_id && candidate.trajectory_id.trim() !== '') {
+        evidenceTrajectoryIds.push(candidate.trajectory_id.trim());
+      }
+      if (Array.isArray(candidate.evidence_trajectory_ids)) {
+        for (const tid of candidate.evidence_trajectory_ids) {
+          if (typeof tid === 'string' && tid.trim() !== '' && !evidenceTrajectoryIds.includes(tid.trim())) {
+            evidenceTrajectoryIds.push(tid.trim());
+          }
+        }
+      }
+
       const evolved = evolveMemoryWriteInTx(
         memoryStore,
         {
@@ -228,6 +255,7 @@ export class CandidateStore {
           content: candidate.content,
           source: `candidate:${candidate.id}`,
           confidence: candidate.confidence,
+          evidence_trajectory_ids: evidenceTrajectoryIds,
           verified_by_user: true,
         },
         { actor: 'user', supersedeConflicts: true },

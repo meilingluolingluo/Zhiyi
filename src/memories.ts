@@ -39,8 +39,26 @@ export function normalizeMemoryStatus(value: unknown): MemoryStatus {
   return MEMORY_STATUSES.includes(value as MemoryStatus) ? (value as MemoryStatus) : 'active';
 }
 
-interface RawMemoryRow extends Omit<Memory, 'verified_by_user'> {
+export function parseEvidenceTrajectoryIds(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+  }
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+      }
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+interface RawMemoryRow extends Omit<Memory, 'verified_by_user' | 'evidence_trajectory_ids'> {
   verified_by_user?: number | boolean;
+  evidence_trajectory_ids?: string | string[];
 }
 
 function rowToMemory(row: RawMemoryRow): Memory {
@@ -58,6 +76,7 @@ function rowToMemory(row: RawMemoryRow): Memory {
     content: row.content,
     source: row.source,
     confidence: Number(row.confidence),
+    evidence_trajectory_ids: parseEvidenceTrajectoryIds(row.evidence_trajectory_ids),
     verified_by_user: Boolean(row.verified_by_user),
     expires_at: row.expires_at ?? null,
     superseded_by: row.superseded_by ?? null,
@@ -82,6 +101,7 @@ export class MemoryStore {
     const now: string = new Date().toISOString();
     const status: MemoryStatus = normalizeMemoryStatus(input.status);
     const archivedAt: string | null = status === 'archived' || status === 'superseded' ? now : null;
+    const evidenceIds: string[] = parseEvidenceTrajectoryIds(input.evidence_trajectory_ids);
     const memory: Memory = {
       memory_id: `mem_${randomUUID()}`,
       user_id: input.user_id,
@@ -96,6 +116,7 @@ export class MemoryStore {
       content: input.content,
       source: input.source ?? 'api',
       confidence: clampConfidence(input.confidence),
+      evidence_trajectory_ids: evidenceIds,
       verified_by_user: Boolean(input.verified_by_user),
       expires_at: input.expires_at ?? null,
       superseded_by: null,
@@ -107,8 +128,8 @@ export class MemoryStore {
       `INSERT INTO memories
        (memory_id, user_id, agent_id, project_id, goal_id, task_id,
         type, scope, category, status, content, source, confidence,
-        verified_by_user, expires_at, superseded_by, archived_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        evidence_trajectory_ids, verified_by_user, expires_at, superseded_by, archived_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         memory.memory_id,
         memory.user_id,
@@ -123,6 +144,7 @@ export class MemoryStore {
         memory.content,
         memory.source,
         memory.confidence,
+        JSON.stringify(memory.evidence_trajectory_ids),
         memory.verified_by_user ? 1 : 0,
         memory.expires_at,
         memory.superseded_by,
@@ -213,6 +235,7 @@ export class MemoryStore {
       'task_id',
       'source',
       'confidence',
+      'evidence_trajectory_ids',
       'verified_by_user',
       'expires_at',
       'superseded_by',
@@ -227,6 +250,7 @@ export class MemoryStore {
       else if (field === 'category') params.push(normalizeMemoryCategory(value));
       else if (field === 'status') params.push(normalizeMemoryStatus(value));
       else if (field === 'confidence') params.push(clampConfidence(value as number));
+      else if (field === 'evidence_trajectory_ids') params.push(JSON.stringify(parseEvidenceTrajectoryIds(value)));
       else if (field === 'verified_by_user') params.push(value ? 1 : 0);
       else params.push(value === undefined ? null : value);
     }

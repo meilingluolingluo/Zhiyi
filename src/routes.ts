@@ -154,6 +154,11 @@ export function createRouter(deps: AppDeps): Router {
       : 'personal';
     const source: string = typeof body.source === 'string' ? body.source.trim() || 'api' : 'api';
     const isModelActor = source === 'model-inference' || source === 'auto-extract';
+    const evidenceTrajectoryIds: string[] = Array.isArray(body.evidence_trajectory_ids)
+      ? body.evidence_trajectory_ids.filter(
+          (id: unknown): id is string => typeof id === 'string' && id.trim().length > 0,
+        )
+      : [];
     const evolved = evolveMemoryWrite(
       deps.memoryStore,
       {
@@ -177,6 +182,7 @@ export function createRouter(deps: AppDeps): Router {
         content: body.content.trim(),
         source,
         confidence: typeof body.confidence === 'number' ? body.confidence : 0.8,
+        evidence_trajectory_ids: evidenceTrajectoryIds,
         expires_at: typeof body.expires_at === 'string' && body.expires_at.trim() !== '' ? body.expires_at.trim() : null,
       },
       {

@@ -62,6 +62,7 @@ export interface Memory {
   content: string;
   source: string;
   confidence: number;
+  evidence_trajectory_ids: string[];
   verified_by_user: boolean;
   expires_at: string | null;
   superseded_by: string | null;
@@ -84,6 +85,7 @@ export interface NewMemory {
   content: string;
   source?: string;
   confidence?: number;
+  evidence_trajectory_ids?: string[];
   verified_by_user?: boolean;
   expires_at?: string | null;
 }
@@ -101,6 +103,7 @@ export interface MemoryPatch {
   task_id?: string | null;
   source?: string;
   confidence?: number;
+  evidence_trajectory_ids?: string[];
   verified_by_user?: boolean;
   expires_at?: string | null;
   superseded_by?: string | null;
@@ -233,6 +236,7 @@ export interface MemoryCandidate {
   content: string;
   source: string;
   trajectory_id: string | null;
+  evidence_trajectory_ids?: string[];
   conflict_memory_id: string | null;
   confidence: number;
   status: CandidateStatus;

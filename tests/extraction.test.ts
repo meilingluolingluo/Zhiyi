@@ -57,6 +57,7 @@ describe('场景四：自动提取 → 候选 → 确认入库', () => {
       expect(approved.json.idempotent).toBe(false);
       expect(approved.json.memory.content).toContain('PostgreSQL');
       expect(approved.json.memory.source).toContain('candidate:');
+      expect(approved.json.memory.evidence_trajectory_ids).toEqual([trajectory.id]);
 
       const memories = await h.api('/v1/memories');
       expect(
