@@ -307,16 +307,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
             <div class="field-tip" id="proxyApiKeyTip">密钥保存在本机本地网关，不向外部泄露</div>
           </div>
 
-          <div>
-            <label class="field-label" for="proxyProtocol">上游出站协议</label>
-            <select class="select" id="proxyProtocol">
-              <option value="auto">自动适配 (推荐，按 URL 自动选路)</option>
-              <option value="openai_chat">OpenAI Chat 协议 (/v1/chat/completions)</option>
-              <option value="anthropic_messages">Anthropic Messages 协议 (/v1/messages)</option>
-            </select>
-          </div>
-
-          <div>
+          <div class="col-span-2">
             <div class="field-header">
               <label class="field-label" for="proxyModelSelect">主模型 ID</label>
               <button type="button" class="btn-fetch-models" id="btnFetchProxyModels" title="从 API 拉取实时可用模型列表">
@@ -331,6 +322,8 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
             <div class="field-tip" id="proxyModelTip">选择上游服务的模型标识</div>
           </div>
         </div>
+
+        <input type="hidden" id="proxyProtocol" value="auto">
 
         <div style="display:none" aria-hidden="true">
           <input type="checkbox" id="ducxReport" checked>
@@ -362,8 +355,6 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
           <span>端点: <code class="mono" id="sumMemUrl" style="font-weight:600">-</code></span>
           <span>·</span>
           <span>模型: <code class="mono" id="sumMemModel" style="font-weight:600;color:var(--accent)">-</code></span>
-          <span>·</span>
-          <span>协议: <span id="sumMemProto" style="font-weight:600">-</span></span>
         </div>
 
         <div class="memory-form-collapse collapsed" id="memoryCustomSection">
@@ -378,16 +369,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
               <input class="input" id="memApiKey" type="password" placeholder="留空沿用主模型 Key" autocomplete="new-password">
             </div>
 
-            <div>
-              <label class="field-label" for="memProtocol">Memory 上游协议</label>
-              <select class="select" id="memProtocol">
-                <option value="auto">自动适配</option>
-                <option value="openai_chat">OpenAI Chat 协议</option>
-                <option value="anthropic_messages">Anthropic Messages 协议</option>
-              </select>
-            </div>
-
-            <div>
+            <div class="col-span-2">
               <div class="field-header">
                 <label class="field-label" for="memModelSelect">Memory 抽取模型 ID</label>
                 <button type="button" class="btn-fetch-models" id="btnFetchMemModels" title="从 API 拉取实时可用模型列表">
@@ -402,6 +384,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
               <div class="field-tip" id="memModelTip">推荐配置响应极速、性价比高的模型，加速后台记忆抽取</div>
             </div>
           </div>
+          <input type="hidden" id="memProtocol" value="auto">
         </div>
       </section>
     </main>
@@ -540,8 +523,6 @@ client = OpenAI(
   function syncAllLinkages(){
     var pUrl = $('proxyBaseUrl').value.trim();
     var pModel = $('proxyModel').value.trim();
-    var pProto = $('proxyProtocol').value;
-    var protoName = (pProto === 'anthropic_messages') ? 'Anthropic Messages' : (pProto === 'openai_chat' ? 'OpenAI Chat' : '自动适配');
 
     var isReused = $('memoryReuseProxy').checked;
 
@@ -551,7 +532,6 @@ client = OpenAI(
       if (sumBox) sumBox.style.display = 'flex';
       $('sumMemUrl').textContent = pUrl || '(未设置)';
       $('sumMemModel').textContent = pModel || '(未设置)';
-      $('sumMemProto').textContent = protoName;
       $('reuseBadge').textContent = '已复用 Proxy 组';
       $('reuseBadge').className = 'badge ok';
       $('memoryCustomSection').classList.add('collapsed');
@@ -751,10 +731,10 @@ client = OpenAI(
   /* 输入事件全链路联动 */
   $('proxyBaseUrl').addEventListener('input', syncAllLinkages);
   $('proxyModel').addEventListener('input', syncAllLinkages);
-  $('proxyProtocol').addEventListener('change', syncAllLinkages);
+  if ($('proxyProtocol')) $('proxyProtocol').addEventListener('change', syncAllLinkages);
   $('memBaseUrl').addEventListener('input', syncAllLinkages);
   $('memModel').addEventListener('input', syncAllLinkages);
-  $('memProtocol').addEventListener('change', syncAllLinkages);
+  if ($('memProtocol')) $('memProtocol').addEventListener('change', syncAllLinkages);
   $('memoryReuseProxy').addEventListener('change', syncAllLinkages);
 
   /* 预设卡片点击填入并连贯联动 */
