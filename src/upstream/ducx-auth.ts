@@ -1,12 +1,9 @@
 /**
- * DUCX 认证桥（参照 codex-mixin 的 provider/auth/ducx.rs + upstream/ducx.rs）。
+ * DUCX 本机认证桥。
  *
- * 原理：DUCX 是百度 Codex fork，登录态保存在 ~/.baidu-cx。知忆启动一个一次性
- * loopback 捕获服务，用 `-c model_providers.oneapi.base_url=<loopback>` 把 DUCX
- * 的握手请求引到本机，从请求头里拿到 `comate_custom_header` 与 `Authorization`，
- * 随后杀掉 DUCX 进程，把这些 native headers 注入到真正的上游请求。
- *
- * 与 codex-mixin 一致：缓存 60 秒，401/403 时失效并重新铸造；header 值绝不写日志。
+ * 职责：捕获本机 DUCX 登录态（包含 comate_custom_header 与 authorization），
+ * 注入至出站请求。认证头在内存中缓存 60 秒，并在 401/403 异常时主动失效并重新铸造；
+ * 认证头明文绝不记入日志。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';

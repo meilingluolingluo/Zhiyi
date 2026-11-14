@@ -168,7 +168,7 @@ export class ExtractionQueue {
     };
     const send = async (body: Record<string, unknown>): Promise<Response> => {
       if (this.deps.upstream) {
-        return (await this.deps.upstream.sendChat(body)).response;
+        return (await this.deps.upstream.sendChat(body, { forMemory: true })).response;
       }
       const route = resolveOneApiRoute(
         this.deps.config.upstreamBaseUrl,

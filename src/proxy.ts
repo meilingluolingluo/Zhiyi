@@ -135,60 +135,59 @@ export async function handleChatCompletion(
     return;
   }
 
-  // 复用路由中间件已解析的身份，避免同一请求生成两个不同的 request_id。
+  const originalMessages: ChatMessage[] = cloneMessages(rawBody.messages);
   const identity: ResolvedIdentity =
     (res.locals.identity as ResolvedIdentity | undefined) ??
     resolveIdentity(deps.config, req.headers as HeaderBag, rawBody);
-
-  const requestModel: string | undefined =
-    typeof rawBody.model === 'string' && rawBody.model.trim() !== '' ? rawBody.model.trim() : undefined;
-  const resolved: Awaited<ReturnType<UpstreamService['resolveForRequest']>> = deps.upstream
-    ? await deps.upstream.resolveForRequest(requestModel)
-    : null;
-
-  // 只删除自定义扩展字段，其余 OpenAI 协议字段（含 tools / tool_choice / tool_calls）原样透传。
-  const cleanBody: Record<string, unknown> = { ...rawBody };
-  for (const field of STRIPPED_BODY_FIELDS) delete cleanBody[field];
-  cleanBody.model = resolved?.model ?? requestModel ?? deps.config.defaultModel;
-
-  const originalMessages: ChatMessage[] = cloneMessages(rawBody.messages);
-
-  // DUCX 来源上报：异步执行，失败只记日志，不影响模型请求。
-  const userPrompt: string = lastUserPrompt(originalMessages);
-  if (userPrompt !== '' && deps.upstream) {
-    void deps.upstream
-      .reportUsage({
-        sessionId: identity.session_id ?? 'unknown-session',
-        prompt: userPrompt,
-        cwd: process.cwd(),
-      })
-      .catch((error: unknown): void => {
-        deps.logger.warn('DUCX 来源上报失败（不影响请求）', error);
-      });
-  }
-
-  const context = buildMemoryContext({
-    config: deps.config,
-    memoryStore: deps.memoryStore,
-    agentStore: deps.agentStore,
-    identity,
-    messages: originalMessages,
-  });
-  const finalMessages: ChatMessage[] =
-    context.injected && context.systemMessage
-      ? injectMemoryMessages(originalMessages, context.systemMessage)
-      : originalMessages;
-  cleanBody.messages = finalMessages;
-
-  const requestSnapshot: string = JSON.stringify(cleanBody);
-  const model: string = String(cleanBody.model);
-  const wantsStream: boolean = cleanBody.stream === true;
+  let model: string = deps.config.defaultModel;
+  let requestSnapshot = '';
   const controller = new AbortController();
   const timer: ReturnType<typeof setTimeout> = setTimeout((): void => {
     controller.abort(new Error('upstream timeout'));
   }, deps.config.upstreamTimeoutMs);
 
   try {
+    const requestModel: string | undefined =
+      typeof rawBody.model === 'string' && rawBody.model.trim() !== '' ? rawBody.model.trim() : undefined;
+    const resolved: Awaited<ReturnType<UpstreamService['resolveForRequest']>> = deps.upstream
+      ? await deps.upstream.resolveForRequest(requestModel)
+      : null;
+
+    // 只删除自定义扩展字段，其余 OpenAI 协议字段（含 tools / tool_choice / tool_calls）原样透传。
+    const cleanBody: Record<string, unknown> = { ...rawBody };
+    for (const field of STRIPPED_BODY_FIELDS) delete cleanBody[field];
+    cleanBody.model = resolved?.model ?? requestModel ?? deps.config.defaultModel;
+
+    // DUCX 来源上报：异步执行，失败只记日志，不影响模型请求。
+    const userPrompt: string = lastUserPrompt(originalMessages);
+    if (userPrompt !== '' && deps.upstream) {
+      void deps.upstream
+        .reportUsage({
+          sessionId: identity.session_id ?? 'unknown-session',
+          prompt: userPrompt,
+          cwd: process.cwd(),
+        })
+        .catch((error: unknown): void => {
+          deps.logger.warn('DUCX 来源上报失败（不影响请求）', error);
+        });
+    }
+
+    const context = buildMemoryContext({
+      config: deps.config,
+      memoryStore: deps.memoryStore,
+      agentStore: deps.agentStore,
+      identity,
+      messages: originalMessages,
+    });
+    const finalMessages: ChatMessage[] =
+      context.injected && context.systemMessage
+        ? injectMemoryMessages(originalMessages, context.systemMessage)
+        : originalMessages;
+    cleanBody.messages = finalMessages;
+
+    requestSnapshot = JSON.stringify(cleanBody);
+    model = String(cleanBody.model);
+    const wantsStream: boolean = cleanBody.stream === true;
     let upstream: Response;
     if (deps.upstream) {
       const sent = await deps.upstream.sendChat(cleanBody, {

@@ -37,6 +37,14 @@ export interface ModelSettings {
   ducxExecutable: string;
   modelOverride: ModelOverride;
   updatedAt: string;
+
+  /** 内核记忆处理模型配置（提取、候选生成与演进） */
+  memoryReuseProxy?: boolean;
+  memoryBaseUrl?: string;
+  memoryApiKey?: string;
+  memoryAuthMode?: AuthMode;
+  memoryModel?: string;
+  memoryProtocol?: UpstreamProtocol;
 }
 
 export type SettingsPatch = Partial<Omit<ModelSettings, 'updatedAt'>>;
@@ -49,6 +57,8 @@ export interface ProviderPreset {
   modelsPath: string;
   modelsSource: ModelsSource;
   description: string;
+  defaultModel?: string;
+  upstreamProtocol?: UpstreamProtocol;
 }
 
 export const DEFAULT_DUCX_EXECUTABLE: string = path.join(
@@ -56,11 +66,66 @@ export const DEFAULT_DUCX_EXECUTABLE: string = path.join(
   '.baidu-cx/baidu-cx/bin/ducx',
 );
 
-/** codex-mixin 的 Baidu OneAPI 模型发现端点：比 /v1/models 多出 auto 等特殊模型与能力元数据。 */
+/** Baidu OneAPI 扩展模型发现端点：包含 auto 等模型与能力元数据。 */
 export const BAIDU_AVAILABLE_MODELS_PATH = '/openapi/v2/available_models';
 
-/** 常用上游预设：以通用中转与本机代理为主，兼容 Baidu OneAPI 登录态。 */
+/** 常用上游提供商预设配置。 */
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
+  {
+    id: 'local-proxy',
+    label: '百度 OneAPI (本机代理)',
+    baseUrl: 'http://127.0.0.1:8787/v1',
+    authMode: 'api_key',
+    modelsPath: '/models',
+    modelsSource: 'single',
+    defaultModel: 'DeepSeek-V4-Flash-baidu-oneapi',
+    upstreamProtocol: 'auto',
+    description: '本机 8787 端口代理服务，零延迟直连',
+  },
+  {
+    id: 'baidu-oneapi-ducx',
+    label: '百度 OneAPI (企业统一服务)',
+    baseUrl: 'https://oneapi-comate.baidu-int.com/v1',
+    authMode: 'ducx',
+    modelsPath: '/models',
+    modelsSource: 'auto',
+    defaultModel: 'DeepSeek-V4-Flash-baidu-oneapi',
+    upstreamProtocol: 'auto',
+    description: '企业统一接口，支持本机 DUCX 免密登录态或 API 令牌',
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek 官方',
+    baseUrl: 'https://api.deepseek.com/v1',
+    authMode: 'api_key',
+    modelsPath: '/models',
+    modelsSource: 'auto',
+    defaultModel: 'deepseek-chat',
+    upstreamProtocol: 'openai_chat',
+    description: 'DeepSeek 官方 API，高性价比推理与代码能力',
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI 官方',
+    baseUrl: 'https://api.openai.com/v1',
+    authMode: 'api_key',
+    modelsPath: '/models',
+    modelsSource: 'auto',
+    defaultModel: 'gpt-4o',
+    upstreamProtocol: 'openai_chat',
+    description: 'OpenAI 官方标准 API 服务',
+  },
+  {
+    id: 'anthropic',
+    label: 'Anthropic Claude',
+    baseUrl: 'https://api.anthropic.com/v1',
+    authMode: 'api_key',
+    modelsPath: '/models',
+    modelsSource: 'auto',
+    defaultModel: 'claude-3-5-sonnet-20241022',
+    upstreamProtocol: 'anthropic_messages',
+    description: 'Anthropic 官方 Messages 协议 API',
+  },
   {
     id: 'custom',
     label: '通用 OpenAI 兼容接口',
@@ -68,25 +133,9 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     authMode: 'api_key',
     modelsPath: '/models',
     modelsSource: 'auto',
-    description: '适配 OpenAI、DeepSeek、OpenRouter 及任意标准中转 API',
-  },
-  {
-    id: 'local-proxy',
-    label: '本机代理服务',
-    baseUrl: 'http://127.0.0.1:8787/v1',
-    authMode: 'api_key',
-    modelsPath: '/models',
-    modelsSource: 'single',
-    description: '连接本机已运行的中转代理端口',
-  },
-  {
-    id: 'baidu-oneapi-ducx',
-    label: 'Baidu OneAPI',
-    baseUrl: 'https://oneapi-comate.baidu-int.com/v1',
-    authMode: 'ducx',
-    modelsPath: '/models',
-    modelsSource: 'auto',
-    description: '使用本机登录态直连，免填 API Key',
+    defaultModel: '',
+    upstreamProtocol: 'auto',
+    description: '适配任意标准第三方中转、Ollama、vLLM 或本地模型',
   },
 ];
 
@@ -180,6 +229,29 @@ export function validateSettingsPatch(patch: SettingsPatch): string[] {
       errors.push('DUCX 路径必须为绝对路径');
     }
   }
+  if (patch.memoryReuseProxy !== undefined && typeof patch.memoryReuseProxy !== 'boolean') {
+    errors.push('memoryReuseProxy 必须为布尔值');
+  }
+  if (patch.memoryBaseUrl !== undefined && patch.memoryBaseUrl.trim() !== '') {
+    const value: string = normalizeBaseUrl(patch.memoryBaseUrl);
+    try {
+      const parsed: URL = new URL(value);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        errors.push('Memory API Base URL 必须是 http(s) 地址');
+      }
+    } catch {
+      errors.push('Memory API Base URL 不是合法 URL');
+    }
+  }
+  if (patch.memoryAuthMode !== undefined && !AUTH_MODES.includes(patch.memoryAuthMode)) {
+    errors.push('Memory 认证方式必须是 api_key / ducx / none');
+  }
+  if (
+    patch.memoryProtocol !== undefined &&
+    !UPSTREAM_PROTOCOLS.includes(patch.memoryProtocol)
+  ) {
+    errors.push('Memory 上游协议必须是 auto / openai_chat / anthropic_messages / openai_responses');
+  }
   return errors;
 }
 
@@ -206,6 +278,15 @@ export interface PublicSettings {
   updatedAt: string;
   apiKeySet: boolean;
   apiKeyMasked: string;
+
+  // 内核记忆处理模型
+  memoryReuseProxy: boolean;
+  memoryBaseUrl: string;
+  memoryAuthMode: AuthMode;
+  memoryModel: string;
+  memoryProtocol: UpstreamProtocol;
+  memoryApiKeySet: boolean;
+  memoryApiKeyMasked: string;
 }
 
 export function toPublicSettings(settings: ModelSettings): PublicSettings {
@@ -225,6 +306,14 @@ export function toPublicSettings(settings: ModelSettings): PublicSettings {
     updatedAt: settings.updatedAt,
     apiKeySet: settings.apiKey.trim() !== '',
     apiKeyMasked: maskApiKey(settings.apiKey),
+
+    memoryReuseProxy: settings.memoryReuseProxy !== false,
+    memoryBaseUrl: settings.memoryBaseUrl ?? '',
+    memoryAuthMode: settings.memoryAuthMode ?? 'api_key',
+    memoryModel: settings.memoryModel ?? '',
+    memoryProtocol: settings.memoryProtocol ?? 'auto',
+    memoryApiKeySet: (settings.memoryApiKey ?? '').trim() !== '',
+    memoryApiKeyMasked: maskApiKey(settings.memoryApiKey ?? ''),
   };
 }
 
@@ -268,6 +357,30 @@ export class SettingsStore {
                 ? stored.titleModel.trim()
                 : (initial.titleModel ?? ''),
             ducxReport: typeof stored.ducxReport === 'boolean' ? stored.ducxReport : initial.ducxReport,
+            memoryReuseProxy:
+              typeof stored.memoryReuseProxy === 'boolean'
+                ? stored.memoryReuseProxy
+                : (initial.memoryReuseProxy ?? true),
+            memoryBaseUrl:
+              typeof stored.memoryBaseUrl === 'string'
+                ? normalizeBaseUrl(stored.memoryBaseUrl)
+                : (initial.memoryBaseUrl ?? ''),
+            memoryApiKey:
+              typeof stored.memoryApiKey === 'string'
+                ? stored.memoryApiKey
+                : (initial.memoryApiKey ?? ''),
+            memoryAuthMode:
+              AUTH_MODES.includes(stored.memoryAuthMode as AuthMode)
+                ? (stored.memoryAuthMode as AuthMode)
+                : (initial.memoryAuthMode ?? 'api_key'),
+            memoryModel:
+              typeof stored.memoryModel === 'string'
+                ? stored.memoryModel.trim()
+                : (initial.memoryModel ?? ''),
+            memoryProtocol:
+              UPSTREAM_PROTOCOLS.includes(stored.memoryProtocol as UpstreamProtocol)
+                ? (stored.memoryProtocol as UpstreamProtocol)
+                : (initial.memoryProtocol ?? 'auto'),
           };
         }
       } catch {
@@ -287,6 +400,30 @@ export class SettingsStore {
       // 任意一次显式写入都表示启用运行期覆盖；停用只能通过 reset()。
       active: patch.active ?? true,
       baseUrl: patch.baseUrl === undefined ? this.state.baseUrl : normalizeBaseUrl(patch.baseUrl),
+      memoryReuseProxy:
+        patch.memoryReuseProxy !== undefined
+          ? patch.memoryReuseProxy
+          : (this.state.memoryReuseProxy ?? true),
+      memoryBaseUrl:
+        patch.memoryBaseUrl === undefined
+          ? (this.state.memoryBaseUrl ?? '')
+          : normalizeBaseUrl(patch.memoryBaseUrl),
+      memoryApiKey:
+        patch.memoryApiKey === undefined
+          ? (this.state.memoryApiKey ?? '')
+          : patch.memoryApiKey,
+      memoryAuthMode:
+        patch.memoryAuthMode !== undefined && AUTH_MODES.includes(patch.memoryAuthMode)
+          ? patch.memoryAuthMode
+          : (this.state.memoryAuthMode ?? 'api_key'),
+      memoryModel:
+        patch.memoryModel === undefined
+          ? (this.state.memoryModel ?? '')
+          : patch.memoryModel.trim(),
+      memoryProtocol:
+        patch.memoryProtocol !== undefined && UPSTREAM_PROTOCOLS.includes(patch.memoryProtocol)
+          ? patch.memoryProtocol
+          : (this.state.memoryProtocol ?? 'auto'),
       updatedAt: new Date().toISOString(),
     };
     this.state = next;

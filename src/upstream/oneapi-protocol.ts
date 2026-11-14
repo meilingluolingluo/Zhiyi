@@ -1,14 +1,12 @@
 /**
- * OneAPI / 多协议出站适配层（参考 codex-mixin 的 provider/registry + protocol/convert + openai_events）：
+ * 多协议上游适配层。
  *
- * 让知忆直接调用 Baidu OneAPI（https://oneapi-comate.baidu-int.com）或标准 OpenAI 端点，
- * 无需再经过本机 8787 codex-mixin 代理：
- * - `openai_chat`        -> /v1/chat/completions（默认兼容端点与 8787 代理）
- * - `anthropic_messages` -> /v1/messages（Baidu OneAPI 非 GPT 模型：Claude / Grok / DeepSeek / Opus / Kimi / MiniMax / auto）
- * - `openai_responses`   -> /v1/responses（Baidu OneAPI GPT 系列模型）
+ * 职责：统一对接各类模型服务与协议出站端点：
+ * - `openai_chat`        -> /v1/chat/completions（标准兼容端点）
+ * - `anthropic_messages` -> /v1/messages（Anthropic 协议模型）
+ * - `openai_responses`   -> /v1/responses（Responses 协议模型）
  *
- * 所有对外返回统一规整为标准 OpenAI Chat Completions 格式（流式 SSE 与非流式 JSON），
- * 以便知忆 ModelAdapter、OpenClaw Agent Core、ExtractionQueue、proxy 与设置页测试复用同一条链路。
+ * 所有出站响应统一规整为标准 OpenAI Chat Completions 格式返回。
  */
 import type { ChatMessage } from '../types';
 import { endpointUrl, normalizeBaseUrl } from './model-settings';
@@ -47,8 +45,7 @@ export function isBaiduOneApiUrl(baseUrl: string): boolean {
 }
 
 /**
- * 若启用了直连 Baidu OneAPI（或显式多协议模式），剥离 codex-mixin 风格的 `-baidu-oneapi` 展示后缀，
- * 还原真实上游模型名（如 `Grok-4.7-baidu-oneapi` -> `Grok-4.7`）；标准代理地址则原样透传。
+ * 解析出站真实上游模型标识；直连对应服务时自动规范化渠道展示后缀。
  */
 export function resolveUpstreamModelId(
   baseUrl: string,

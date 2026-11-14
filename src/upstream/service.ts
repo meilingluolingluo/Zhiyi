@@ -111,6 +111,16 @@ export interface TitleGenerationResult {
   fallback: boolean;
 }
 
+export interface TestGroupDiagnostic {
+  ok: boolean;
+  baseUrl: string;
+  model: string;
+  status: number | null;
+  latencyMs: number;
+  error: string | null;
+  reused?: boolean;
+}
+
 export interface TestResult {
   ok: boolean;
   baseUrl: string;
@@ -120,6 +130,8 @@ export interface TestResult {
   latencyMs: number;
   chat: string | null;
   error: string | null;
+  proxyGroup?: TestGroupDiagnostic;
+  memoryGroup?: TestGroupDiagnostic;
 }
 
 interface ModelCache {
@@ -156,6 +168,12 @@ export function initialSettings(
     ducxReport: true,
     ducxExecutable: DEFAULT_DUCX_EXECUTABLE,
     modelOverride: 'settings',
+    memoryReuseProxy: true,
+    memoryBaseUrl: '',
+    memoryApiKey: '',
+    memoryAuthMode: 'api_key',
+    memoryModel: '',
+    memoryProtocol: 'auto',
     updatedAt: new Date().toISOString(),
   };
 }
@@ -209,16 +227,22 @@ export class UpstreamService {
     };
   }
 
-  update(patch: SettingsPatch & { clearApiKey?: boolean }): PublicSettings {
+  update(
+    patch: SettingsPatch & { clearApiKey?: boolean; clearMemoryApiKey?: boolean },
+  ): PublicSettings {
     const errors: string[] = validateSettingsPatch(patch);
     if (errors.length > 0) throw new Error(errors.join('；'));
 
-    const { clearApiKey, ...rest } = patch;
+    const { clearApiKey, clearMemoryApiKey, ...rest } = patch;
     const next: SettingsPatch = { ...rest };
     if (next.apiKey === undefined || next.apiKey === '') {
       // 表单里留空 = 不修改；只有 clearApiKey=true 才真正清空。
       delete next.apiKey;
       if (clearApiKey === true) next.apiKey = '';
+    }
+    if (next.memoryApiKey === undefined || next.memoryApiKey === '') {
+      delete next.memoryApiKey;
+      if (clearMemoryApiKey === true) next.memoryApiKey = '';
     }
     if (next.ducxExecutable !== undefined && next.ducxExecutable.trim() === '') {
       next.ducxExecutable = DEFAULT_DUCX_EXECUTABLE;
@@ -282,30 +306,61 @@ export class UpstreamService {
   async resolveForRequest(requestModel?: string): Promise<ResolvedUpstream | null> {
     const current: ModelSettings = this.store.get();
     if (!current.active) return null;
-    const headers: Record<string, string> = await this.authHeaders();
-    const requested: string | undefined =
-      typeof requestModel === 'string' && requestModel.trim() !== '' ? requestModel.trim() : undefined;
-    const model: string =
-      current.modelOverride === 'request' && requested
-        ? requested
-        : current.model.trim() !== ''
-          ? current.model.trim()
-          : requested ?? this.config.defaultModel;
-    return {
-      baseUrl: normalizeBaseUrl(current.baseUrl) || normalizeBaseUrl(this.config.upstreamBaseUrl),
-      headers,
-      model,
-      authMode: current.authMode,
-      onAuthRejected: (): void => {
-        if (current.authMode === 'ducx') this.ducxFor(current.ducxExecutable).invalidate();
-      },
-    };
+    try {
+      const headers: Record<string, string> = await this.authHeaders();
+      const requested: string | undefined =
+        typeof requestModel === 'string' && requestModel.trim() !== '' ? requestModel.trim() : undefined;
+      const model: string =
+        current.modelOverride === 'request' && requested
+          ? requested
+          : current.model.trim() !== ''
+            ? current.model.trim()
+            : requested ?? this.config.defaultModel;
+      return {
+        baseUrl: normalizeBaseUrl(current.baseUrl) || normalizeBaseUrl(this.config.upstreamBaseUrl),
+        headers,
+        model,
+        authMode: current.authMode,
+        onAuthRejected: (): void => {
+          if (current.authMode === 'ducx') this.ducxFor(current.ducxExecutable).invalidate();
+        },
+      };
+    } catch (error) {
+      this.logger.error('解析上游服务请求配置失败', error);
+      return null;
+    }
   }
 
-  async authHeaders(): Promise<Record<string, string>> {
+  async authHeaders(forMemory = false): Promise<Record<string, string>> {
     const current: ModelSettings = this.store.get();
+    if (forMemory && current.memoryReuseProxy === false) {
+      if (current.memoryAuthMode === 'ducx') {
+        try {
+          return { ...(await this.ducxFor(current.ducxExecutable).headers()) };
+        } catch (err) {
+          this.logger.warn('获取 Memory 组 DUCX 认证头失败', err);
+          if (current.memoryApiKey && current.memoryApiKey.trim() !== '') {
+            return { authorization: `Bearer ${current.memoryApiKey.trim()}` };
+          }
+          return {};
+        }
+      }
+      if (current.memoryAuthMode === 'api_key' && current.memoryApiKey && current.memoryApiKey.trim() !== '') {
+        return { authorization: `Bearer ${current.memoryApiKey.trim()}` };
+      }
+      return {};
+    }
+
     if (current.authMode === 'ducx') {
-      return { ...(await this.ducxFor(current.ducxExecutable).headers()) };
+      try {
+        return { ...(await this.ducxFor(current.ducxExecutable).headers()) };
+      } catch (err) {
+        this.logger.warn('获取 Proxy 组 DUCX 认证头失败', err);
+        if (current.apiKey.trim() !== '') {
+          return { authorization: `Bearer ${current.apiKey.trim()}` };
+        }
+        return {};
+      }
     }
     if (current.authMode === 'api_key' && current.apiKey.trim() !== '') {
       return { authorization: `Bearer ${current.apiKey.trim()}` };
@@ -315,9 +370,9 @@ export class UpstreamService {
 
   /**
    * 模型列表：默认合并两个来源。
-   * - /v1/models（OpenAI 兼容，所有上游都有）
-   * - /openapi/v2/available_models（Baidu 富信息，含 auto 等特殊模型与能力元数据）
-   * 补充端点不存在时静默忽略，不影响主列表；对齐 codex-mixin 的 Baidu 模型发现。
+   * - /v1/models（OpenAI 兼容端点）
+   * - /openapi/v2/available_models（Baidu 扩展信息，含 auto 等特殊模型与能力元数据）
+   * 补充端点不存在时静默忽略，不影响主列表。
    */
   async listModels(refresh = false): Promise<ModelInfo[]> {
     if (!refresh && this.modelCache && Date.now() - this.modelCache.at < MODEL_CACHE_TTL_MS) {
@@ -429,6 +484,7 @@ export class UpstreamService {
       modelOverride?: string;
       baseUrlOverride?: string;
       apiKeyOverride?: string;
+      forMemory?: boolean;
     } = {},
   ): Promise<{ response: Response; model: string; protocol: ResolvedUpstreamProtocol }> {
     const requestedModel =
@@ -440,13 +496,22 @@ export class UpstreamService {
     const current: ModelSettings = this.store.get();
     const resolved: ResolvedUpstream | null = await this.resolveForRequest(requestedModel);
 
-    const baseUrl: string =
-      resolved?.baseUrl ??
-      (normalizeBaseUrl(options.baseUrlOverride ?? '') ||
-        normalizeBaseUrl(this.config.upstreamBaseUrl));
-    const modelName: string =
-      resolved?.model || requestedModel || this.config.defaultModel;
-    const route = resolveOneApiRoute(baseUrl, modelName, current.upstreamProtocol ?? 'auto');
+    const isMemoryCall = Boolean(
+      options.forMemory && current.memoryReuseProxy === false && current.memoryBaseUrl,
+    );
+    const baseUrl: string = isMemoryCall
+      ? normalizeBaseUrl(current.memoryBaseUrl!)
+      : (resolved?.baseUrl ??
+        (normalizeBaseUrl(options.baseUrlOverride ?? '') ||
+          normalizeBaseUrl(this.config.upstreamBaseUrl)));
+    const modelName: string = isMemoryCall
+      ? (current.memoryModel?.trim() || resolved?.model || requestedModel || this.config.defaultModel)
+      : (resolved?.model || requestedModel || this.config.defaultModel);
+    const route = resolveOneApiRoute(
+      baseUrl,
+      modelName,
+      isMemoryCall ? (current.memoryProtocol ?? 'auto') : (current.upstreamProtocol ?? 'auto'),
+    );
 
     const response: Response = await this.dispatchWithAuthRetry(
       resolved,
@@ -616,51 +681,124 @@ export class UpstreamService {
   async testConnection(withChat: boolean): Promise<TestResult> {
     const started: number = Date.now();
     const current: ModelSettings = this.store.get();
-    const baseUrl: string = normalizeBaseUrl(current.baseUrl) || normalizeBaseUrl(this.config.upstreamBaseUrl);
-    const result: TestResult = {
+    const proxyBaseUrl: string =
+      normalizeBaseUrl(current.baseUrl) || normalizeBaseUrl(this.config.upstreamBaseUrl);
+    const proxyModel: string = current.model || this.config.defaultModel;
+
+    const proxyDiag: TestGroupDiagnostic = {
       ok: false,
-      baseUrl,
-      model: current.model || this.config.defaultModel,
-      modelCount: null,
+      baseUrl: proxyBaseUrl,
+      model: proxyModel,
       status: null,
       latencyMs: 0,
-      chat: null,
       error: null,
     };
+
+    let modelCount: number | null = null;
+    let chatReply: string | null = null;
+
+    // 1. 预检 Proxy 组 (面向客户端的主对话上游)
+    const proxyStart = Date.now();
     try {
       const models: ModelInfo[] = await this.listModels(true);
-      result.modelCount = models.length;
-      result.ok = true;
+      modelCount = models.length;
+      proxyDiag.ok = true;
+      proxyDiag.status = 200;
+
       if (withChat) {
-        const targetModel = current.model || this.config.defaultModel;
         const { response } = await this.sendChat(
           {
-            model: targetModel,
+            model: proxyModel,
             messages: [{ role: 'user', content: '只回复两个字：正常' }],
             stream: false,
             max_tokens: 64,
           },
-          { signal: AbortSignal.timeout(30_000), modelOverride: targetModel },
+          { signal: AbortSignal.timeout(30_000), modelOverride: proxyModel },
         );
-        result.status = response.status;
+        proxyDiag.status = response.status;
         const text: string = await response.text();
-        if (!response.ok) throw new Error(`对话测试失败（HTTP ${response.status}）：${text.slice(0, 200)}`);
+        if (!response.ok) {
+          throw new Error(`对话测试失败（HTTP ${response.status}）：${text.slice(0, 200)}`);
+        }
         try {
           const parsed = JSON.parse(text) as {
             choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
           };
           const message = parsed.choices?.[0]?.message;
-          result.chat = message?.content || message?.reasoning_content || '(空回复)';
+          chatReply = message?.content || message?.reasoning_content || '(空回复)';
         } catch {
-          result.chat = text.slice(0, 120);
+          chatReply = text.slice(0, 120);
         }
       }
     } catch (error) {
-      result.ok = false;
-      result.error = error instanceof Error ? error.message : String(error);
+      proxyDiag.ok = false;
+      proxyDiag.error = error instanceof Error ? error.message : String(error);
     }
-    result.latencyMs = Date.now() - started;
-    return result;
+    proxyDiag.latencyMs = Date.now() - proxyStart;
+
+    // 2. 预检 Memory 组 (内核记忆处理模型)
+    let memoryDiag: TestGroupDiagnostic;
+    if (current.memoryReuseProxy !== false) {
+      memoryDiag = {
+        reused: true,
+        ok: proxyDiag.ok,
+        baseUrl: proxyBaseUrl,
+        model: proxyModel,
+        status: proxyDiag.status,
+        latencyMs: proxyDiag.latencyMs,
+        error: proxyDiag.error,
+      };
+    } else {
+      const memStart = Date.now();
+      const memBaseUrl = normalizeBaseUrl(current.memoryBaseUrl || proxyBaseUrl);
+      const memModel = current.memoryModel || proxyModel;
+      memoryDiag = {
+        reused: false,
+        ok: false,
+        baseUrl: memBaseUrl,
+        model: memModel,
+        status: null,
+        latencyMs: 0,
+        error: null,
+      };
+      try {
+        const memUrl = modelsUrl(memBaseUrl, current.modelsPath || '/models');
+        const memHeaders: Record<string, string> = {
+          'content-type': 'application/json',
+          ...(await this.authHeaders(true)),
+        };
+        const resp = await this.transport(memUrl, {
+          method: 'GET',
+          headers: memHeaders,
+          signal: AbortSignal.timeout(15_000),
+        });
+        memoryDiag.status = resp.status;
+        if (!resp.ok) {
+          const errDetail = await resp.text().catch(() => '');
+          throw new Error(`Memory 组列表请求失败（HTTP ${resp.status}）：${errDetail.slice(0, 200)}`);
+        }
+        memoryDiag.ok = true;
+      } catch (err) {
+        memoryDiag.ok = false;
+        memoryDiag.error = err instanceof Error ? err.message : String(err);
+      }
+      memoryDiag.latencyMs = Date.now() - memStart;
+    }
+
+    const overallOk = proxyDiag.ok && memoryDiag.ok;
+
+    return {
+      ok: overallOk,
+      baseUrl: proxyBaseUrl,
+      model: proxyModel,
+      modelCount,
+      status: proxyDiag.status,
+      latencyMs: Date.now() - started,
+      chat: chatReply,
+      error: proxyDiag.error || memoryDiag.error || null,
+      proxyGroup: proxyDiag,
+      memoryGroup: memoryDiag,
+    };
   }
 
   private ducxFor(executable: string): DucxAuth {
@@ -728,7 +866,7 @@ function definedFields(info: ModelInfo): Partial<ModelInfo> {
  * 解析模型列表。
  * - OpenAI 源：{data:[{id, display_name, description, ...}]}、裸数组、{models:[...]}
  * - Baidu 源：{data:[{model, capability, capability_set, ...}]}
- *   · 剥离 `-内部` 后缀；非内部版本优先覆盖（与 codex-mixin 一致）
+ *   · 剥离 `-内部` 后缀；非内部版本优先覆盖
  *   · 排除没有 capability 元数据的条目
  *   · 提取描述、倍率、价格类型、上下文长度、图像 / 思考能力
  */

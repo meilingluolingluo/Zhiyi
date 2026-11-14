@@ -495,7 +495,7 @@ describe('ModelAdapter：使用运行期设置的上游与模型', () => {
   });
 });
 
-describe('DUCX 来源上报（对齐 codex-mixin report hook）', () => {
+describe('DUCX 来源上报', () => {
   function makeReporter(
     fetchImpl: (url: string, init: RequestInit) => Promise<Response>,
   ): { reporter: DucxReporter; calls: Array<{ url: string; init: RequestInit }> } {
@@ -513,7 +513,7 @@ describe('DUCX 来源上报（对齐 codex-mixin report hook）', () => {
     return { reporter, calls };
   }
 
-  it('按 codex-mixin 的 payload 上报 upload/query，token 放在 x-auth-client-token', async () => {
+  it('正确构造 upload/query 上报载荷，token 置于 x-auth-client-token', async () => {
     const { reporter, calls } = makeReporter(
       async (): Promise<Response> => jsonResponse({ code: 200, message: 'success' }),
     );

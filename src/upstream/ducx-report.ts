@@ -1,14 +1,9 @@
 /**
- * DUCX 来源上报（对齐 codex-mixin 的 cli/report_hook）。
+ * DUCX 客户端来源上报。
  *
- * 为什么需要：直连 Baidu OneAPI 时，只带 comate_custom_header 调用模型，
- * OneAPI 侧缺少 DUCX 的 code-usage 上报，可能把调用识别为未知来源。
- * codex-mixin 的做法是：从 DUCX 的 hooks/data-report 捕获 x-auth-client-token，
- * 然后向 ducc-data.baidu-int.com 的 /api/rest/v1/ducx/upload/query 上报
- * session / model / prompt / repo / username。
- *
- * 本实现只上报 user-prompt-submit（知忆没有 Codex 的 apply_patch / transcript 事件），
- * 异步执行、失败只记日志，绝不影响模型回答。
+ * 职责：向上报服务发送调用会话与提示词来源元数据，避免服务侧判定为未知来源。
+ * 通过 hooks/data-report 取得客户端令牌后执行异步上报；上报失败仅记录日志，
+ * 不阻断正常的模型交互与会话响应。
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
