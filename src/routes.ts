@@ -123,6 +123,10 @@ export function createRouter(deps: AppDeps): Router {
   });
 
   // ===== 健康检查 =====
+  router.get('/', (_req: ExpressRequest, res: ExpressResponse): void => {
+    res.redirect('/settings');
+  });
+
   router.get('/health', (_req: ExpressRequest, res: ExpressResponse): void => {
     let dbOk = true;
     try {
@@ -131,14 +135,25 @@ export function createRouter(deps: AppDeps): Router {
       dbOk = false;
       deps.logger.error('健康检查：数据库不可用');
     }
+    const upstreamView = deps.upstream ? deps.upstream.view() : null;
+    const isCustomActive = upstreamView?.active ?? false;
+    const effectiveBaseUrl = isCustomActive
+      ? (upstreamView?.effectiveBaseUrl ?? null)
+      : (deps.config.mockUpstream ? null : deps.config.upstreamBaseUrl);
+    const effectiveModel = isCustomActive
+      ? (upstreamView?.model || deps.config.defaultModel)
+      : deps.config.defaultModel;
+
     res.status(dbOk ? 200 : 503).json({
       status: dbOk ? 'ok' : 'degraded',
       db: dbOk ? 'ok' : 'error',
       upstream: {
         mode: deps.config.mockUpstream ? 'mock' : 'remote',
-        base_url: deps.config.mockUpstream ? null : deps.config.upstreamBaseUrl,
-        api_key_configured: !deps.config.mockUpstream && deps.config.upstreamApiKey !== '',
-        default_model: deps.config.defaultModel,
+        base_url: effectiveBaseUrl,
+        api_key_configured: isCustomActive
+          ? Boolean(upstreamView?.apiKeySet)
+          : (!deps.config.mockUpstream && deps.config.upstreamApiKey !== ''),
+        default_model: effectiveModel,
       },
       memory: {
         enabled: deps.config.memoryEnabled,
