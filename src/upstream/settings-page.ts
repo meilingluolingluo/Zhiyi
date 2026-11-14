@@ -134,46 +134,17 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
 }
 .input-btn:hover{color:var(--ink);background:var(--soft)}
 
-/* 分段切换按钮组 */
-.segment-group{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;background:var(--soft);padding:4px;border-radius:10px;border:1px solid var(--line)}
-.segment-opt{
-  border:none;background:transparent;padding:7px 10px;border-radius:7px;cursor:pointer;
-  font-size:12.5px;font-weight:500;color:var(--muted);transition:all .15s var(--ease);text-align:center
-}
-.segment-opt:hover{color:var(--ink)}
-.segment-opt.active{background:#fff;color:var(--accent);font-weight:600;box-shadow:0 1px 3px rgba(15,23,42,.08)}
-
-/* 常用推荐模型标签 */
-.model-chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 12px}
-.chip{
-  font-size:11.5px;padding:4px 9px;border-radius:7px;border:1px solid var(--line);
-  background:var(--soft);color:var(--ink-soft);cursor:pointer;font-family:var(--mono);
-  transition:all .14s var(--ease)
-}
-.chip:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
-
-/* 模型搜索与列表卡片 */
-.model-search-bar{display:flex;gap:8px;margin-bottom:8px}
-.model-search-bar input{flex:1;height:36px;padding:0 10px;border:1px solid var(--line);border-radius:8px;font-size:12.5px}
-.model-search-bar input:focus{outline:none;border-color:var(--accent)}
-.model-picker-list{max-height:220px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;background:#fff}
-.model-row{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;
-  border-bottom:1px solid #f1f5f9;cursor:pointer;transition:background .12s
-}
-.model-row:last-child{border-bottom:none}
-.model-row:hover{background:var(--soft)}
-.model-row.active{background:var(--accent-soft);color:var(--accent)}
-.model-row-id{font-family:var(--mono);font-size:12.5px;font-weight:600;word-break:break-all}
-.model-row-desc{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
 /* 复选框与折叠区域 */
 .reuse-banner{
   display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;
-  border-radius:10px;background:var(--accent-soft);border:1px solid var(--accent-line);margin-bottom:14px
+  border-radius:10px;background:var(--accent-soft);border:1px solid var(--accent-line);margin-bottom:10px
 }
 .checkbox-label{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--ink);cursor:pointer}
 .checkbox-label input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
+.reuse-summary{
+  font-size:12.5px;color:var(--ink-soft);padding:10px 14px;background:var(--soft);
+  border-radius:10px;border:1px solid var(--line);margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap
+}
 .memory-form-collapse{overflow:hidden;transition:all .22s var(--ease)}
 .memory-form-collapse.collapsed{display:none}
 
@@ -335,26 +306,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
           <div>
             <label class="field-label" for="proxyModel">主模型 ID</label>
             <input class="input mono" id="proxyModel" placeholder="例如 deepseek-chat 或 gpt-4o" autocomplete="off">
-          </div>
-
-          <div class="col-span-2">
-            <div class="field-label">常用模型快捷点选</div>
-            <div class="model-chips" id="quickModelChips">
-              <span class="chip" data-model="deepseek-chat">deepseek-chat</span>
-              <span class="chip" data-model="deepseek-reasoner">deepseek-reasoner</span>
-              <span class="chip" data-model="gpt-4o">gpt-4o</span>
-              <span class="chip" data-model="gpt-4o-mini">gpt-4o-mini</span>
-              <span class="chip" data-model="claude-3-7-sonnet-20250219">claude-3-7-sonnet</span>
-              <span class="chip" data-model="claude-3-5-haiku-20241022">claude-3-5-haiku</span>
-            </div>
-
-            <div class="model-search-bar">
-              <input id="modelFilter" placeholder="在可用模型列表中搜索..." autocomplete="off">
-              <button type="button" class="btn-secondary" id="btnRefreshModels">拉取可用模型列表</button>
-            </div>
-            <div class="model-picker-list" id="modelPickerList">
-              <div style="padding:16px;text-align:center;color:var(--muted);font-size:12px">加载模型列表中...</div>
-            </div>
+            <div class="field-tip">指定上游服务的模型标识</div>
           </div>
         </div>
 
@@ -383,11 +335,20 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
           <span class="badge ok" id="reuseBadge">已复用 Proxy 组</span>
         </div>
 
+        <div class="reuse-summary" id="reuseSummary">
+          <span style="color:var(--muted)">当前继承 Proxy 组：</span>
+          <span>端点: <code class="mono" id="sumMemUrl" style="font-weight:600">-</code></span>
+          <span>·</span>
+          <span>模型: <code class="mono" id="sumMemModel" style="font-weight:600;color:var(--accent)">-</code></span>
+          <span>·</span>
+          <span>协议: <span id="sumMemProto" style="font-weight:600">-</span></span>
+        </div>
+
         <div class="memory-form-collapse collapsed" id="memoryCustomSection">
           <div class="form-grid">
             <div class="col-span-2">
               <label class="field-label" for="memBaseUrl">Memory 接口地址（Base URL）</label>
-              <input class="input mono" id="memBaseUrl" placeholder="留空沿用主模型地址" autocomplete="off">
+              <input class="input mono" id="memBaseUrl" placeholder="例如 https://api.deepseek.com/v1" autocomplete="off">
             </div>
 
             <div class="col-span-2" id="memApiKeyContainer">
@@ -515,7 +476,6 @@ client = OpenAI(
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   var presets = ${JSON.stringify(PROVIDER_PRESETS)};
-  var allModels = [];
   var currentSettings = null;
   var currentProxyAuth = 'api_key';
   var currentMemAuth = 'api_key';
@@ -545,14 +505,57 @@ client = OpenAI(
     });
   }
 
-  /* 更新 Agent 接入命令 */
-  function updateSnippets(){
-    var model = $('proxyModel').value.trim() || 'deepseek-chat';
-    var text = 'export ANTHROPIC_BASE_URL="http://127.0.0.1:8790/v1"\\nclaude --model ' + model;
-    var pre = $('claudeCodeSnippet');
-    if (pre) pre.textContent = text;
-    var btn = $('copyClaudeBtn');
-    if (btn) btn.setAttribute('data-copy', text);
+  /* 联动核心：更新继承展示、Agent 代码示例与状态卡片 */
+  function syncAllLinkages(){
+    var pUrl = $('proxyBaseUrl').value.trim();
+    var pModel = $('proxyModel').value.trim();
+    var pProto = $('proxyProtocol').value;
+    var protoName = (pProto === 'anthropic_messages') ? 'Anthropic Messages' : (pProto === 'openai_chat' ? 'OpenAI Chat' : '自动适配');
+
+    var isReused = $('memoryReuseProxy').checked;
+
+    // 1. 同步 Memory 组继承展示
+    var sumBox = $('reuseSummary');
+    if (isReused) {
+      if (sumBox) sumBox.style.display = 'flex';
+      $('sumMemUrl').textContent = pUrl || '(未设置)';
+      $('sumMemModel').textContent = pModel || '(未设置)';
+      $('sumMemProto').textContent = protoName;
+      $('reuseBadge').textContent = '已复用 Proxy 组';
+      $('reuseBadge').className = 'badge ok';
+      $('memoryCustomSection').classList.add('collapsed');
+    } else {
+      if (sumBox) sumBox.style.display = 'none';
+      $('reuseBadge').textContent = '独立配置';
+      $('reuseBadge').className = 'badge accent';
+      $('memoryCustomSection').classList.remove('collapsed');
+    }
+
+    // 2. 同步右侧 Agent 接入代码 (Claude Code 与 OpenAI SDK)
+    var modelForSnippet = pModel || 'deepseek-chat';
+    var claudeCmd = 'export ANTHROPIC_BASE_URL="http://127.0.0.1:8790/v1"\\nclaude --model ' + modelForSnippet;
+    var preClaude = $('claudeCodeSnippet');
+    if (preClaude) preClaude.textContent = claudeCmd;
+    var btnClaude = $('copyClaudeBtn');
+    if (btnClaude) btnClaude.setAttribute('data-copy', claudeCmd);
+
+    // 3. 同步右侧网关当前生效状态卡片
+    $('stProxyUrl').textContent = pUrl || '默认';
+    $('stProxyModel').textContent = pModel || '默认';
+    if (isReused) {
+      $('stMemoryStatus').textContent = '复用 Proxy 组' + (pModel ? ' (' + pModel + ')' : '');
+    } else {
+      var mModel = $('memModel').value.trim();
+      $('stMemoryStatus').textContent = '独立模型: ' + (mModel || '未设置');
+    }
+
+    // 4. 高亮当前匹配的预设卡片
+    var matchedPreset = presets.find(function(p){
+      return p.baseUrl === pUrl && (p.defaultModel === pModel || !pModel);
+    });
+    document.querySelectorAll('.preset-card').forEach(function(c){
+      c.classList.toggle('active', Boolean(matchedPreset && c.getAttribute('data-preset-id') === matchedPreset.id));
+    });
   }
 
   /* 认证方式设置 */
@@ -572,19 +575,16 @@ client = OpenAI(
     }
   });
 
-  /* 常用模型 Chip 点选 */
-  $('quickModelChips').addEventListener('click', function(e){
-    var chip = e.target.closest('.chip');
-    if (chip && chip.dataset.model) {
-      $('proxyModel').value = chip.dataset.model;
-      updateSnippets();
-      toast('已选择模型: ' + chip.dataset.model);
-    }
-  });
+  /* 输入事件全链路联动 */
+  $('proxyBaseUrl').addEventListener('input', syncAllLinkages);
+  $('proxyModel').addEventListener('input', syncAllLinkages);
+  $('proxyProtocol').addEventListener('change', syncAllLinkages);
+  $('memBaseUrl').addEventListener('input', syncAllLinkages);
+  $('memModel').addEventListener('input', syncAllLinkages);
+  $('memProtocol').addEventListener('change', syncAllLinkages);
+  $('memoryReuseProxy').addEventListener('change', syncAllLinkages);
 
-  $('proxyModel').addEventListener('input', updateSnippets);
-
-  /* 预设卡片点击填入 */
+  /* 预设卡片点击填入并连贯联动 */
   $('presetsGrid').addEventListener('click', function(e){
     var card = e.target.closest('.preset-card');
     if (!card) return;
@@ -592,99 +592,33 @@ client = OpenAI(
     var found = presets.find(function(p){ return p.id === id; });
     if (!found) return;
 
-    document.querySelectorAll('.preset-card').forEach(function(c){ c.classList.remove('active'); });
-    card.classList.add('active');
-
     $('proxyBaseUrl').value = found.baseUrl || '';
     setProxyAuth(found.authMode || 'api_key');
     if (found.upstreamProtocol) $('proxyProtocol').value = found.upstreamProtocol;
     if (found.defaultModel) $('proxyModel').value = found.defaultModel;
 
-    updateSnippets();
-    toast('已套用预设: ' + found.label);
-    $('proxyApiKey').focus();
-    loadModels(true);
-  });
-
-  /* 记忆模型复用开关 */
-  $('memoryReuseProxy').addEventListener('change', function(){
-    var checked = this.checked;
-    $('memoryCustomSection').classList.toggle('collapsed', checked);
-    $('reuseBadge').textContent = checked ? '已复用 Proxy 组' : '独立配置';
-    $('reuseBadge').className = 'badge ' + (checked ? 'ok' : 'accent');
-  });
-
-  /* 加载并渲染可用模型列表 */
-  function renderModelList(filterText){
-    var listEl = $('modelPickerList');
-    var q = (filterText || '').trim().toLowerCase();
-    var filtered = allModels.filter(function(m){
-      return !q || m.id.toLowerCase().includes(q) || (m.display_name && m.display_name.toLowerCase().includes(q));
-    });
-
-    if (filtered.length === 0) {
-      listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:12px">未找到匹配的模型</div>';
-      return;
+    // 若当前未复用且记忆字段为空，自动填充对应默认值
+    if (!$('memoryReuseProxy').checked && !$('memModel').value.trim()) {
+      if (found.defaultModel) $('memModel').value = found.defaultModel;
+      if (found.baseUrl) $('memBaseUrl').value = found.baseUrl;
+      if (found.upstreamProtocol) $('memProtocol').value = found.upstreamProtocol;
     }
 
-    var html = '';
-    filtered.slice(0, 100).forEach(function(m){
-      var isCurrent = ($('proxyModel').value.trim() === m.id);
-      html += '<div class="model-row' + (isCurrent ? ' active' : '') + '" data-model-id="' + escapeHtml(m.id) + '">' +
-        '<div>' +
-          '<div class="model-row-id">' + escapeHtml(m.id) + '</div>' +
-          (m.display_name ? '<div class="model-row-desc">' + escapeHtml(m.display_name) + '</div>' : '') +
-        '</div>' +
-        '<span class="badge">' + escapeHtml(m.owned_by || 'upstream') + '</span>' +
-      '</div>';
-    });
-    listEl.innerHTML = html;
-  }
-
-  $('modelFilter').addEventListener('input', function(){
-    renderModelList(this.value);
-  });
-
-  $('modelPickerList').addEventListener('click', function(e){
-    var row = e.target.closest('.model-row');
-    if (!row) return;
-    var mid = row.getAttribute('data-model-id');
-    $('proxyModel').value = mid;
-    updateSnippets();
-    renderModelList($('modelFilter').value);
-    toast('已选择模型: ' + mid);
-  });
-
-  function loadModels(refresh){
-    var listEl = $('modelPickerList');
-    listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-size:12px">正在获取上游模型列表...</div>';
-    api('/v1/zhiyi/models' + (refresh ? '?refresh=1' : '')).then(function(res){
-      allModels = res.data || [];
-      renderModelList($('modelFilter').value);
-    }).catch(function(err){
-      listEl.innerHTML = '<div style="padding:16px;text-align:center;color:var(--bad);font-size:12px">获取模型列表失败: ' + escapeHtml(err.message) + '</div>';
-    });
-  }
-
-  $('btnRefreshModels').addEventListener('click', function(){
-    loadModels(true);
+    syncAllLinkages();
+    toast('已套用预设: ' + found.label);
+    $('proxyApiKey').focus();
   });
 
   /* 刷新状态面板 */
   function updateStatus(data){
     currentSettings = data;
-    $('stProxyUrl').textContent = data.baseUrl || data.effectiveBaseUrl || '默认';
-    $('stProxyModel').textContent = data.model || '默认';
-    $('stMemoryStatus').textContent = data.memoryReuseProxy !== false ? '复用 Proxy 组' : (data.memoryModel || '独立配置');
     $('gatewayStatusBadge').innerHTML = '<i class="dot"></i><span>' + (data.active ? '运行中 (自定义配置)' : '运行中 (环境默认)') + '</span>';
-    updateSnippets();
+    syncAllLinkages();
   }
 
   /* 加载页面数据 */
   function loadSettings(){
     return api('/v1/zhiyi/settings').then(function(data){
-      updateStatus(data);
-
       $('proxyBaseUrl').value = data.baseUrl || '';
       setProxyAuth(data.authMode || 'api_key');
       $('proxyProtocol').value = data.upstreamProtocol || 'auto';
@@ -696,9 +630,6 @@ client = OpenAI(
 
       var reuse = (data.memoryReuseProxy !== false);
       $('memoryReuseProxy').checked = reuse;
-      $('memoryCustomSection').classList.toggle('collapsed', reuse);
-      $('reuseBadge').textContent = reuse ? '已复用 Proxy 组' : '独立配置';
-      $('reuseBadge').className = 'badge ' + (reuse ? 'ok' : 'accent');
 
       $('memBaseUrl').value = data.memoryBaseUrl || '';
       currentMemAuth = data.memoryAuthMode || 'api_key';
@@ -708,8 +639,7 @@ client = OpenAI(
       if ($('ducxReport')) $('ducxReport').checked = (data.ducxReport !== false);
       if ($('ducxExecutable') && data.ducxExecutable) $('ducxExecutable').value = data.ducxExecutable;
 
-      updateSnippets();
-      loadModels(false);
+      updateStatus(data);
     }).catch(function(err){
       toast('读取配置失败: ' + err.message, 'bad');
     });
