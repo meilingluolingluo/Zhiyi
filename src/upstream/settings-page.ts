@@ -358,24 +358,11 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
           </div>
         </div>
 
-        <details class="advanced-options" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
-          <summary style="font-size:12px;color:var(--muted);cursor:pointer;font-weight:500">高级选项 (凭证与来源)</summary>
-          <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px">
-            <div class="segment-group" id="proxyAuthSegment" style="display:none">
-              <button type="button" class="segment-opt active" data-auth="api_key">API Key</button>
-              <button type="button" class="segment-opt" data-auth="ducx">DUCX 登录态</button>
-              <button type="button" class="segment-opt" data-auth="none">免密</button>
-            </div>
-            <label class="checkbox-label" style="font-size:12px">
-              <input type="checkbox" id="ducxReport" checked>
-              <span>启用客户端来源上报</span>
-            </label>
-            <div id="ducxSettingsGroup" style="display:none">
-              <label class="field-label" for="ducxExecutable">DUCX 可执行文件路径</label>
-              <input class="input mono" id="ducxExecutable" placeholder="~/.baidu-cx/baidu-cx/bin/ducx" autocomplete="off">
-            </div>
-          </div>
-        </details>
+        <div style="display:none" aria-hidden="true">
+          <input type="checkbox" id="ducxReport" checked>
+          <span>来源上报</span>
+          <input class="input mono" id="ducxExecutable" autocomplete="off">
+        </div>
       </section>
 
       <!-- Memory 组：知忆内部内核记忆处理模型 -->
@@ -568,16 +555,9 @@ client = OpenAI(
     if (btn) btn.setAttribute('data-copy', text);
   }
 
-  /* 认证方式切换渲染 */
+  /* 认证方式设置 */
   function setProxyAuth(mode){
-    currentProxyAuth = mode;
-    var btns = $('proxyAuthSegment') ? $('proxyAuthSegment').querySelectorAll('.segment-opt') : [];
-    btns.forEach(function(b){
-      b.classList.toggle('active', b.getAttribute('data-auth') === mode);
-    });
-    $('proxyApiKeyContainer').style.display = (mode === 'api_key' ? 'block' : 'none');
-    var ducxEl = $('ducxSettingsGroup');
-    if (ducxEl) ducxEl.style.display = (mode === 'ducx' ? 'block' : 'none');
+    currentProxyAuth = mode || 'api_key';
   }
 
   /* 切换 API Key 显示明暗 */
