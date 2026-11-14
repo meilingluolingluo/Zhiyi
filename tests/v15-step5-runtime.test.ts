@@ -219,6 +219,8 @@ describe('Step 5.2: ContextBuilder 只读增强用户档案与个人事务上下
     );
 
     expect(ctx.systemMessage).toContain('[知忆 Zhiyi]');
+    expect(ctx.systemMessage).toContain('【当前时间与环境】');
+    expect(ctx.systemMessage).toContain('当前时间：');
     expect(ctx.systemMessage).toContain('林深');
     expect(ctx.systemMessage).toContain('Asia/Shanghai');
     expect(ctx.systemMessage).toContain('完成知忆 V1.5 交付');
