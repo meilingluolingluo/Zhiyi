@@ -120,7 +120,8 @@ function identify(
 ): { ok: true; identity: PersonalAIIdentity } | { ok: false; status: number; error: string } {
   const body: Record<string, unknown> = bodyOf(req);
   const rawBody: string = (req as RawBodyRequest).rawBody ?? JSON.stringify(body);
-  const result = resolvePersonalAIIdentity(config, req.headers as HeaderBag, body, rawBody);
+  const clientIp = (req as any).ip || req.socket?.remoteAddress;
+  const result = resolvePersonalAIIdentity(config, req.headers as HeaderBag, body, rawBody, { clientIp });
   if (!result.ok || !result.identity) {
     return { ok: false, status: result.status ?? 401, error: result.error ?? '身份解析失败' };
   }

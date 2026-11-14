@@ -28,6 +28,7 @@ export interface PersonalAIIdentity {
   project_id: string | null;
   conversation_id: string;
   signature_verified: boolean;
+  client_ip?: string | null;
 }
 
 export interface IdentityResolution {
@@ -106,11 +107,24 @@ export function deriveConversationId(
   return `conv_${digest}`;
 }
 
+function extractClientIp(headers: HeaderBag, remoteIp?: string | null): string {
+  const xForwardedFor = header(headers, 'x-forwarded-for');
+  if (xForwardedFor) {
+    const first = xForwardedFor.split(',')[0].trim();
+    if (first) return first;
+  }
+  const xRealIp = header(headers, 'x-real-ip');
+  if (xRealIp && xRealIp.trim() !== '') return xRealIp.trim();
+  if (remoteIp && remoteIp.trim() !== '') return remoteIp.trim();
+  return '127.0.0.1';
+}
+
 export function resolvePersonalAIIdentity(
   config: PersonalAIConfig,
   headers: HeaderBag,
   body: Record<string, unknown>,
   rawBody: string,
+  options?: { clientIp?: string | null },
 ): IdentityResolution {
   const signatureError: string | null = verifySignature(
     config.sharedSecret,
@@ -159,6 +173,7 @@ export function resolvePersonalAIIdentity(
       project_id: firstText(header(headers, 'x-project-id'), body.project_id, metadata.project_id),
       conversation_id: conversationId,
       signature_verified: config.sharedSecret !== '',
+      client_ip: extractClientIp(headers, options?.clientIp),
     },
   };
 }

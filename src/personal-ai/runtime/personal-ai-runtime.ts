@@ -366,19 +366,7 @@ export class PersonalAIRuntime {
       return;
     }
 
-    const directToolNames = new Set([
-      'recall_memory',
-      'remember_memory',
-      'update_memory',
-      'memory_search',
-      'memory_get',
-      'web_search',
-      'web_fetch',
-    ]);
-    const registeredTools = this.deps.toolGateway
-      .listRegisteredTools()
-      .filter((tool) => directToolNames.has(tool.name));
-
+    const registeredTools = this.deps.toolGateway.listRegisteredTools();
     if (registeredTools.length === 0) {
       for await (const delta of this.deps.modelAdapter.stream(context.messages, {
         model: modelName,
@@ -402,15 +390,16 @@ export class PersonalAIRuntime {
       },
     }));
 
+    const allowedToolNames = new Set(registeredTools.map((tool) => tool.name));
     const toolCtx: ZhiyiToolContext = {
       userId: identity.user_id,
       identity,
-      allowedTools: directToolNames,
+      allowedTools: allowedToolNames,
       publicOrigin,
     };
 
     const currentMessages: ChatMessage[] = [...context.messages];
-    const maxToolTurns = 3;
+    const maxToolTurns = 6;
 
     for (let turn = 0; turn < maxToolTurns; turn += 1) {
       if (signal?.aborted) break;
