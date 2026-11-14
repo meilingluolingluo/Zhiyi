@@ -1,6 +1,7 @@
 /**
- * 知忆 Zhiyi · 模型与中转服务设置页（挂载于网关 /settings 端点）。
- * 统一管理主对话转发上游（Proxy 组）与内核记忆处理模型（Memory 组），提供实时通路预检与 Agent 接入指引。
+ * 知忆 Zhiyi · 模型配置页（挂载于网关 /settings 端点）。
+ * 统一管理面向 Agent 客户端调用的主对话模型（Proxy 组）与后台记忆提取处理模型（Memory 组），
+ * 提供实时通路预检与 Agent 接入指引。
  */
 import { PROVIDER_PRESETS } from './model-settings';
 
@@ -12,21 +13,24 @@ function escapeHtml(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
-const INITIAL_PRESETS_HTML: string = PROVIDER_PRESETS.map(
-  (p) =>
-    `<button type="button" class="preset-card" data-preset-id="${escapeHtml(p.id)}">
-      <div class="preset-badge">${escapeHtml(p.upstreamProtocol === 'anthropic_messages' ? 'Anthropic' : 'OpenAI')}</div>
-      <div class="preset-name">${escapeHtml(p.label)}</div>
-      <div class="preset-desc">${escapeHtml(p.description)}</div>
-    </button>`,
-).join('');
+const INITIAL_PRESETS_HTML: string = PROVIDER_PRESETS
+  .filter((p) => ['deepseek', 'openai', 'anthropic', 'custom'].includes(p.id))
+  .map(
+    (p) =>
+      `<button type="button" class="preset-card" data-preset-id="${escapeHtml(p.id)}">
+        <div class="preset-badge">${escapeHtml(p.upstreamProtocol === 'anthropic_messages' ? 'Anthropic' : 'OpenAI')}</div>
+        <div class="preset-name">${escapeHtml(p.label)}</div>
+        <div class="preset-desc">${escapeHtml(p.description)}</div>
+      </button>`,
+  )
+  .join('');
 
 export const SETTINGS_PAGE_HTML: string = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>知忆 Zhiyi · 模型与服务配置</title>
+<title>知忆 Zhiyi · 模型配置</title>
 <style>
 :root{
   color-scheme:light;
@@ -96,9 +100,8 @@ body{
 .hint-inline{font-size:12px;color:var(--muted)}
 
 /* 常用预设网格 */
-.presets-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
-@media (max-width:720px){.presets-grid{grid-template-columns:repeat(2,1fr)}}
-@media (max-width:480px){.presets-grid{grid-template-columns:1fr}}
+.presets-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+@media (max-width:600px){.presets-grid{grid-template-columns:1fr}}
 .preset-card{
   text-align:left;padding:12px 14px;border:1px solid var(--line);border-radius:12px;
   background:var(--soft);cursor:pointer;color:var(--ink);position:relative;
@@ -269,8 +272,8 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
     <div class="brand">
       <div class="logo-icon">知</div>
       <div class="title-group">
-        <h1>知忆 Zhiyi · 模型与中转服务设置</h1>
-        <div class="sub">统一管理主对话转发上游与内核记忆处理模型，提供实时通路预检与 Agent 接入指引</div>
+        <h1>知忆 Zhiyi · 模型配置</h1>
+        <div class="sub">统一配置面向 Agent 客户端调用的主对话模型（Proxy 组）与后台记忆提取处理模型（Memory 组）</div>
       </div>
     </div>
     <div class="top-actions">
@@ -284,10 +287,10 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
       <section class="card">
         <div class="card-head">
           <div class="card-head-title">
-            <h2>常用模型提供商</h2>
+            <h2>常用模型服务商预设</h2>
             <span class="badge accent">一键填入</span>
           </div>
-          <span class="hint-inline">点击卡片自动填充端点、协议与推荐模型</span>
+          <span class="hint-inline">点击自动填充 API 端点、出站协议与推荐模型</span>
         </div>
         <div class="presets-grid" id="presetsGrid">
           ${INITIAL_PRESETS_HTML}
@@ -301,80 +304,78 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
             <h2>主对话模型 (Proxy 组)</h2>
             <span class="badge accent">客户端与 Agent 转发</span>
           </div>
-          <span class="hint-inline">Claude Code / Codex / DSH / Web 对话使用的模型</span>
+          <span class="hint-inline">Claude Code / Cursor / OpenCode / Web 对话使用的模型</span>
         </div>
 
         <div class="form-grid">
           <div class="col-span-2">
-            <label class="field-label" for="proxyBaseUrl">API 地址（Base URL）</label>
-            <input class="input mono" id="proxyBaseUrl" placeholder="例如 http://127.0.0.1:8787/v1 或 https://api.deepseek.com/v1" autocomplete="off">
-            <div class="field-tip">上游 OpenAI 兼容中转或官方接口地址，以 http(s):// 开头</div>
-          </div>
-
-          <div class="col-span-2">
-            <label class="field-label">认证方式</label>
-            <div class="segment-group" id="proxyAuthSegment">
-              <button type="button" class="segment-opt" data-auth="api_key">API Key (Bearer)</button>
-              <button type="button" class="segment-opt" data-auth="ducx">本机 DUCX 登录态</button>
-              <button type="button" class="segment-opt" data-auth="none">无需认证 (免密)</button>
-            </div>
+            <label class="field-label" for="proxyBaseUrl">API 接口地址（Base URL）</label>
+            <input class="input mono" id="proxyBaseUrl" placeholder="例如 https://api.deepseek.com/v1 或 https://api.openai.com/v1" autocomplete="off">
+            <div class="field-tip">上游 OpenAI 兼容或官方接口地址，以 http(s):// 开头</div>
           </div>
 
           <div class="col-span-2" id="proxyApiKeyContainer">
-            <label class="field-label" for="proxyApiKey">API Key / 令牌凭证</label>
+            <label class="field-label" for="proxyApiKey">API Key / 接口密钥</label>
             <div class="input-wrap">
               <input class="input" id="proxyApiKey" type="password" placeholder="sk-... 或留空保持当前已保存的 Key" autocomplete="new-password">
               <button type="button" class="input-btn" id="toggleApiKey">显示</button>
             </div>
-            <div class="field-tip" id="proxyApiKeyTip">密钥仅保存在本机网关本地，绝不上报外部服务</div>
-          </div>
-
-          <div class="col-span-2" id="ducxSettingsGroup" style="display:none;background:var(--soft);padding:12px 14px;border-radius:10px;border:1px solid var(--line)">
-            <label class="checkbox-label" style="margin-bottom:8px">
-              <input type="checkbox" id="ducxReport" checked>
-              <span>启用客户端来源上报（自动向 DUCX 上报客户端来源，避免 OneAPI 拦截）</span>
-            </label>
-            <div style="margin-top:8px">
-              <label class="field-label" for="ducxExecutable">DUCX 可执行文件路径</label>
-              <input class="input mono" id="ducxExecutable" placeholder="~/.baidu-cx/baidu-cx/bin/ducx" autocomplete="off">
-            </div>
+            <div class="field-tip" id="proxyApiKeyTip">密钥保存在本机本地网关，不向外部泄露</div>
           </div>
 
           <div>
             <label class="field-label" for="proxyProtocol">上游出站协议</label>
             <select class="select" id="proxyProtocol">
-              <option value="auto">自动适配 (推荐，按 URL 选路)</option>
-              <option value="openai_chat">OpenAI Chat (/v1/chat/completions)</option>
-              <option value="anthropic_messages">Anthropic Messages (/v1/messages)</option>
-              <option value="openai_responses">OpenAI Responses (/v1/responses)</option>
+              <option value="auto">自动适配 (推荐，按 URL 自动选路)</option>
+              <option value="openai_chat">OpenAI Chat 协议 (/v1/chat/completions)</option>
+              <option value="anthropic_messages">Anthropic Messages 协议 (/v1/messages)</option>
             </select>
           </div>
 
           <div>
-            <label class="field-label" for="proxyModel">当前主模型 ID</label>
-            <input class="input mono" id="proxyModel" placeholder="例如 DeepSeek-V4-Flash-baidu-oneapi 或 deepseek-chat" autocomplete="off">
+            <label class="field-label" for="proxyModel">主模型 ID</label>
+            <input class="input mono" id="proxyModel" placeholder="例如 deepseek-chat 或 gpt-4o" autocomplete="off">
           </div>
 
           <div class="col-span-2">
             <div class="field-label">常用模型快捷点选</div>
             <div class="model-chips" id="quickModelChips">
-              <span class="chip" data-model="DeepSeek-V4-Flash-baidu-oneapi">DeepSeek-V4-Flash (OneAPI)</span>
-              <span class="chip" data-model="Claude Sonnet 5.5-baidu-oneapi">Claude Sonnet 5.5 (OneAPI)</span>
-              <span class="chip" data-model="gpt-5.6-sol-baidu-oneapi">GPT-5.6 Sol (OneAPI)</span>
               <span class="chip" data-model="deepseek-chat">deepseek-chat</span>
+              <span class="chip" data-model="deepseek-reasoner">deepseek-reasoner</span>
               <span class="chip" data-model="gpt-4o">gpt-4o</span>
-              <span class="chip" data-model="claude-3-5-sonnet-20241022">claude-3-5-sonnet</span>
+              <span class="chip" data-model="gpt-4o-mini">gpt-4o-mini</span>
+              <span class="chip" data-model="claude-3-7-sonnet-20250219">claude-3-7-sonnet</span>
+              <span class="chip" data-model="claude-3-5-haiku-20241022">claude-3-5-haiku</span>
             </div>
 
             <div class="model-search-bar">
               <input id="modelFilter" placeholder="在可用模型列表中搜索..." autocomplete="off">
-              <button type="button" class="btn-secondary" id="btnRefreshModels">刷新模型列表</button>
+              <button type="button" class="btn-secondary" id="btnRefreshModels">拉取可用模型列表</button>
             </div>
             <div class="model-picker-list" id="modelPickerList">
               <div style="padding:16px;text-align:center;color:var(--muted);font-size:12px">加载模型列表中...</div>
             </div>
           </div>
         </div>
+
+        <details class="advanced-options" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+          <summary style="font-size:12px;color:var(--muted);cursor:pointer;font-weight:500">高级选项 (凭证与来源)</summary>
+          <div style="margin-top:10px;display:flex;flex-direction:column;gap:10px">
+            <div class="segment-group" id="proxyAuthSegment" style="display:none">
+              <button type="button" class="segment-opt active" data-auth="api_key">API Key</button>
+              <button type="button" class="segment-opt" data-auth="ducx">DUCX 登录态</button>
+              <button type="button" class="segment-opt" data-auth="none">免密</button>
+            </div>
+            <label class="checkbox-label" style="font-size:12px">
+              <input type="checkbox" id="ducxReport" checked>
+              <span>启用客户端来源上报</span>
+            </label>
+            <div id="ducxSettingsGroup" style="display:none">
+              <label class="field-label" for="ducxExecutable">DUCX 可执行文件路径</label>
+              <input class="input mono" id="ducxExecutable" placeholder="~/.baidu-cx/baidu-cx/bin/ducx" autocomplete="off">
+            </div>
+          </div>
+        </details>
       </section>
 
       <!-- Memory 组：知忆内部内核记忆处理模型 -->
@@ -384,13 +385,13 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
             <h2>内核记忆模型 (Memory 组)</h2>
             <span class="badge">知忆推理与抽取引擎</span>
           </div>
-          <span class="hint-inline">负责记忆事实抽取、候选记忆审批、反思演进与标题总结</span>
+          <span class="hint-inline">负责对话事实抽取、反思演进与元数据生成</span>
         </div>
 
         <div class="reuse-banner">
           <label class="checkbox-label">
             <input type="checkbox" id="memoryReuseProxy" checked>
-            <span>复用主对话模型配置（推荐）</span>
+            <span>复用 Proxy 组配置（默认推荐）</span>
           </label>
           <span class="badge ok" id="reuseBadge">已复用 Proxy 组</span>
         </div>
@@ -402,33 +403,24 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
               <input class="input mono" id="memBaseUrl" placeholder="留空沿用主模型地址" autocomplete="off">
             </div>
 
-            <div class="col-span-2">
-              <label class="field-label">Memory 认证方式</label>
-              <div class="segment-group" id="memAuthSegment">
-                <button type="button" class="segment-opt" data-auth="api_key">API Key</button>
-                <button type="button" class="segment-opt" data-auth="ducx">DUCX 登录态</button>
-                <button type="button" class="segment-opt" data-auth="none">免密</button>
-              </div>
-            </div>
-
             <div class="col-span-2" id="memApiKeyContainer">
               <label class="field-label" for="memApiKey">Memory API Key</label>
-              <input class="input" id="memApiKey" type="password" placeholder="留空不修改" autocomplete="new-password">
+              <input class="input" id="memApiKey" type="password" placeholder="留空沿用主模型 Key" autocomplete="new-password">
             </div>
 
             <div>
               <label class="field-label" for="memProtocol">Memory 上游协议</label>
               <select class="select" id="memProtocol">
                 <option value="auto">自动适配</option>
-                <option value="openai_chat">OpenAI Chat</option>
-                <option value="anthropic_messages">Anthropic Messages</option>
+                <option value="openai_chat">OpenAI Chat 协议</option>
+                <option value="anthropic_messages">Anthropic Messages 协议</option>
               </select>
             </div>
 
             <div>
               <label class="field-label" for="memModel">Memory 抽取模型 ID</label>
-              <input class="input mono" id="memModel" placeholder="例如 DeepSeek-V4-Flash-baidu-oneapi" autocomplete="off">
-              <div class="field-tip">推荐配置高性价比极速模型，加速后台抽取</div>
+              <input class="input mono" id="memModel" placeholder="例如 deepseek-chat 或 gpt-4o-mini" autocomplete="off">
+              <div class="field-tip">推荐配置响应极速、性价比高的模型，加速后台记忆抽取</div>
             </div>
           </div>
         </div>
@@ -441,7 +433,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
       <section class="card">
         <button type="button" class="btn-primary" id="btnSave">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-          保存并立即生效
+          保存配置并生效
         </button>
 
         <div class="btn-row">
@@ -461,7 +453,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
         <div class="diag-panel" id="diagPanel">
           <div class="diag-group">
             <div class="diag-group-header">
-              <span class="diag-title">Proxy 组通路</span>
+              <span class="diag-title">Proxy 组通路 (主模型)</span>
               <span class="diag-badge ok" id="proxyDiagBadge">就绪</span>
             </div>
             <div class="diag-detail" id="proxyDiagDetail">点击「LLM 通路预检」即可测试端点连通性</div>
@@ -469,7 +461,7 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
 
           <div class="diag-group" style="margin-top:10px">
             <div class="diag-group-header">
-              <span class="diag-title">Memory 组通路</span>
+              <span class="diag-title">Memory 组通路 (记忆模型)</span>
               <span class="diag-badge ok" id="memDiagBadge">复用主组</span>
             </div>
             <div class="diag-detail" id="memDiagDetail">复用主对话模型配置</div>
@@ -491,18 +483,18 @@ input.input:focus,select.select:focus{border-color:var(--accent);box-shadow:0 0 
 
         <div style="font-size:12px;font-weight:600;margin-top:8px">Claude Code 终端接入</div>
         <div class="guide-code-box">
-          <button type="button" class="copy-pill" data-copy="export ANTHROPIC_BASE_URL=&quot;http://127.0.0.1:8790/v1&quot;&#10;claude">复制</button>
-          <pre>export ANTHROPIC_BASE_URL="http://127.0.0.1:8790/v1"
-claude</pre>
+          <button type="button" class="copy-pill" id="copyClaudeBtn">复制</button>
+          <pre id="claudeCodeSnippet">export ANTHROPIC_BASE_URL="http://127.0.0.1:8790/v1"
+claude --model &lt;当前主模型&gt;</pre>
         </div>
 
         <div style="font-size:12px;font-weight:600;margin-top:10px">OpenAI SDK / Python 接入</div>
         <div class="guide-code-box">
-          <button type="button" class="copy-pill" data-copy="from openai import OpenAI&#10;client = OpenAI(base_url=&quot;http://127.0.0.1:8790/v1&quot;, api_key=&quot;local&quot;)">复制</button>
+          <button type="button" class="copy-pill" data-copy="from openai import OpenAI&#10;client = OpenAI(base_url=&quot;http://127.0.0.1:8790/v1&quot;, api_key=&quot;zhiyi-local&quot;)">复制</button>
           <pre>from openai import OpenAI
 client = OpenAI(
   base_url="http://127.0.0.1:8790/v1",
-  api_key="local"
+  api_key="zhiyi-local"
 )</pre>
         </div>
 
@@ -526,7 +518,6 @@ client = OpenAI(
           <div class="status-row"><span class="status-k">Proxy 转发上游</span><span class="status-v" id="stProxyUrl">-</span></div>
           <div class="status-row"><span class="status-k">Proxy 生效模型</span><span class="status-v" id="stProxyModel">-</span></div>
           <div class="status-row"><span class="status-k">Memory 组状态</span><span class="status-v" id="stMemoryStatus">复用 Proxy 组</span></div>
-          <div class="status-row"><span class="status-k">DUCX 登录态</span><span class="status-v" id="stDucxStatus">-</span></div>
         </div>
       </section>
     </aside>
@@ -567,10 +558,20 @@ client = OpenAI(
     });
   }
 
+  /* 更新 Agent 接入命令 */
+  function updateSnippets(){
+    var model = $('proxyModel').value.trim() || 'deepseek-chat';
+    var text = 'export ANTHROPIC_BASE_URL="http://127.0.0.1:8790/v1"\\nclaude --model ' + model;
+    var pre = $('claudeCodeSnippet');
+    if (pre) pre.textContent = text;
+    var btn = $('copyClaudeBtn');
+    if (btn) btn.setAttribute('data-copy', text);
+  }
+
   /* 认证方式切换渲染 */
   function setProxyAuth(mode){
     currentProxyAuth = mode;
-    var btns = $('proxyAuthSegment').querySelectorAll('.segment-opt');
+    var btns = $('proxyAuthSegment') ? $('proxyAuthSegment').querySelectorAll('.segment-opt') : [];
     btns.forEach(function(b){
       b.classList.toggle('active', b.getAttribute('data-auth') === mode);
     });
@@ -578,25 +579,6 @@ client = OpenAI(
     var ducxEl = $('ducxSettingsGroup');
     if (ducxEl) ducxEl.style.display = (mode === 'ducx' ? 'block' : 'none');
   }
-
-  function setMemAuth(mode){
-    currentMemAuth = mode;
-    var btns = $('memAuthSegment').querySelectorAll('.segment-opt');
-    btns.forEach(function(b){
-      b.classList.toggle('active', b.getAttribute('data-auth') === mode);
-    });
-    $('memApiKeyContainer').style.display = (mode === 'api_key' ? 'block' : 'none');
-  }
-
-  $('proxyAuthSegment').addEventListener('click', function(e){
-    var btn = e.target.closest('.segment-opt');
-    if (btn) setProxyAuth(btn.getAttribute('data-auth'));
-  });
-
-  $('memAuthSegment').addEventListener('click', function(e){
-    var btn = e.target.closest('.segment-opt');
-    if (btn) setMemAuth(btn.getAttribute('data-auth'));
-  });
 
   /* 切换 API Key 显示明暗 */
   $('toggleApiKey').addEventListener('click', function(){
@@ -615,9 +597,12 @@ client = OpenAI(
     var chip = e.target.closest('.chip');
     if (chip && chip.dataset.model) {
       $('proxyModel').value = chip.dataset.model;
+      updateSnippets();
       toast('已选择模型: ' + chip.dataset.model);
     }
   });
+
+  $('proxyModel').addEventListener('input', updateSnippets);
 
   /* 预设卡片点击填入 */
   $('presetsGrid').addEventListener('click', function(e){
@@ -635,7 +620,9 @@ client = OpenAI(
     if (found.upstreamProtocol) $('proxyProtocol').value = found.upstreamProtocol;
     if (found.defaultModel) $('proxyModel').value = found.defaultModel;
 
+    updateSnippets();
     toast('已套用预设: ' + found.label);
+    $('proxyApiKey').focus();
     loadModels(true);
   });
 
@@ -683,6 +670,7 @@ client = OpenAI(
     if (!row) return;
     var mid = row.getAttribute('data-model-id');
     $('proxyModel').value = mid;
+    updateSnippets();
     renderModelList($('modelFilter').value);
     toast('已选择模型: ' + mid);
   });
@@ -708,15 +696,8 @@ client = OpenAI(
     $('stProxyUrl').textContent = data.baseUrl || data.effectiveBaseUrl || '默认';
     $('stProxyModel').textContent = data.model || '默认';
     $('stMemoryStatus').textContent = data.memoryReuseProxy !== false ? '复用 Proxy 组' : (data.memoryModel || '独立配置');
-
-    var ducxInfo = data.ducx;
-    if (ducxInfo && ducxInfo.available) {
-      $('stDucxStatus').textContent = ducxInfo.cached ? '已认证 (缓存有效)' : '可用 (未缓存)';
-    } else {
-      $('stDucxStatus').textContent = '未安装 / 未启用';
-    }
-
     $('gatewayStatusBadge').innerHTML = '<i class="dot"></i><span>' + (data.active ? '运行中 (自定义配置)' : '运行中 (环境默认)') + '</span>';
+    updateSnippets();
   }
 
   /* 加载页面数据 */
@@ -740,25 +721,21 @@ client = OpenAI(
       $('reuseBadge').className = 'badge ' + (reuse ? 'ok' : 'accent');
 
       $('memBaseUrl').value = data.memoryBaseUrl || '';
-      setMemAuth(data.memoryAuthMode || 'api_key');
+      currentMemAuth = data.memoryAuthMode || 'api_key';
       $('memProtocol').value = data.memoryProtocol || 'auto';
       $('memModel').value = data.memoryModel || '';
 
       if ($('ducxReport')) $('ducxReport').checked = (data.ducxReport !== false);
       if ($('ducxExecutable') && data.ducxExecutable) $('ducxExecutable').value = data.ducxExecutable;
 
+      updateSnippets();
       loadModels(false);
     }).catch(function(err){
       toast('读取配置失败: ' + err.message, 'bad');
     });
   }
 
-  /* 保存配置 */
-  $('btnSave').addEventListener('click', function(){
-    var btn = this;
-    btn.disabled = true;
-    btn.innerHTML = '正在保存...';
-
+  function getFormPatch(){
     var patch = {
       baseUrl: $('proxyBaseUrl').value.trim(),
       authMode: currentProxyAuth,
@@ -782,18 +759,28 @@ client = OpenAI(
     var memKeyVal = $('memApiKey').value.trim();
     if (memKeyVal !== '') patch.memoryApiKey = memKeyVal;
 
+    return patch;
+  }
+
+  /* 保存配置 */
+  $('btnSave').addEventListener('click', function(){
+    var btn = this;
+    btn.disabled = true;
+    btn.innerHTML = '正在保存...';
+
+    var patch = getFormPatch();
+
     api('/v1/zhiyi/settings', 'PUT', patch).then(function(saved){
       toast('配置保存成功，已立即生效！');
       $('proxyApiKey').value = '';
       $('memApiKey').value = '';
       loadSettings();
-      // 保存后自动触发一次快速预检
       runHealthCheck(false);
     }).catch(function(err){
       toast('保存失败: ' + err.message, 'bad');
     }).finally(function(){
       btn.disabled = false;
-      btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> 保存并立即生效';
+      btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> 保存配置并生效';
     });
   });
 
@@ -816,7 +803,10 @@ client = OpenAI(
       bubble.style.display = 'none';
     }
 
-    api('/v1/zhiyi/settings/test', 'POST', { chat: Boolean(withChat) }).then(function(res){
+    var patch = getFormPatch();
+    api('/v1/zhiyi/settings', 'PUT', patch).catch(function(){}).then(function(){
+      return api('/v1/zhiyi/settings/test', 'POST', { chat: Boolean(withChat) });
+    }).then(function(res){
       if (res.ok) {
         badgeProxy.className = 'diag-badge ok';
         badgeProxy.textContent = '200 OK (' + res.latencyMs + 'ms)';
