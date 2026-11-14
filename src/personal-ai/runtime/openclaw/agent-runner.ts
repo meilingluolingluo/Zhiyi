@@ -21,6 +21,7 @@ import {
 } from './message-adapter';
 import { resolveAgentAllowedTools } from './tool-gateway';
 import type { OpenClawAgentRunnerDeps, OpenClawRunOptions } from './types';
+import { MemoryContextProvider } from '../memory/context-provider';
 
 const WORK_TOOL_NAMES: readonly string[] = [
   'goal_list',
@@ -39,6 +40,9 @@ const WORK_TOOL_NAMES: readonly string[] = [
 ];
 
 const MEMORY_TOOL_NAMES: readonly string[] = [
+  'recall_memory',
+  'remember_memory',
+  'update_memory',
   'memory_search',
   'memory_get',
   'memory_create',
@@ -48,10 +52,11 @@ const MEMORY_TOOL_NAMES: readonly string[] = [
 
 const MEMORY_TOOL_GUIDANCE: string = [
   '[长期记忆使用准则]',
-  '1. 只保存具有长期价值的用户偏好、稳定个人属性、长期目标、项目关键决策与已验证经验；闲聊或一次性临时安排禁止写入。',
-  '2. 严禁把任务或项目的易变状态（pending/in_progress 等）复制到记忆中；任务状态应始终通过工作管理工具查询。',
-  '3. 保护用户已确认记忆：严禁凭模型推测直接覆盖或归档用户已确认信息；仅当用户明确要求纠正或作废时，才调用 memory_update / memory_archive 并设置 user_confirmed_correction=true。',
-  '4. 写入前可先检索查重，并尽量关联对应的 goal_id / project_id / task_id 以便后续工作上下文精准召回。',
+  '1. 优先使用自动注入：日常问答和任务执行优先使用已自动注入的长期记忆上下文，切忌每轮无意义重复检索。',
+  '2. recall_memory 使用时机：仅当自动注入的上下文不足，或者用户明确询问历史记忆、过往偏好或技术选型时才按需调用。',
+  '3. remember_memory 使用时机：仅当用户明确要求保存（例如“记住……”、“保存偏好……”）时才允许调用；严禁凭模型推测擅自保存闲聊或临时信息。',
+  '4. update_memory 使用时机：仅当用户明确要求纠正或更新特定记忆时调用，必须先明确指定 memory_id；若目标不明确，向用户核实或先用 recall_memory 查找，严禁凭猜测修改相似记忆。',
+  '5. 保护用户已确认记忆：严禁擅自覆盖或弱化用户已确认记忆。',
   '[/长期记忆使用准则]',
 ].join('\n');
 
@@ -122,10 +127,17 @@ export class OpenClawAgentRunner {
 
   constructor(private readonly deps: OpenClawAgentRunnerDeps) {}
 
-  private buildSystemPrompt(agent: AgentProfile, prebuiltSystemMessage?: string): string {
+  private buildSystemPrompt(
+    agent: AgentProfile,
+    prebuiltSystemMessage?: string,
+    taskMemoryContext?: string,
+  ): string {
     const parts: string[] = [];
     if (prebuiltSystemMessage && prebuiltSystemMessage.trim() !== '') {
       parts.push(prebuiltSystemMessage.trim());
+    }
+    if (taskMemoryContext && taskMemoryContext.trim() !== '') {
+      parts.push(taskMemoryContext.trim());
     }
     const allowed = resolveAgentAllowedTools({ agent });
     if (WORK_TOOL_NAMES.some((name) => allowed.has(name))) {
@@ -151,11 +163,47 @@ export class OpenClawAgentRunner {
     const channel = createAsyncEventChannel<PersonalAIEvent>();
     let currentTurns = 0;
 
+    let taskMemoryContext: string | undefined = undefined;
+    const hasPrebuiltMemory = Boolean(
+      options.prebuiltSystemMessage &&
+        options.prebuiltSystemMessage.includes('<personal_memory_context>'),
+    );
+    if (!hasPrebuiltMemory) {
+      const memoryProvider =
+        this.deps.memoryContextProvider ??
+        (this.deps.toolGateway?.memoryService
+          ? new MemoryContextProvider({
+              config: this.deps.config,
+              memoryService: this.deps.toolGateway.memoryService,
+              agentStore: this.deps.agentStore,
+              projectStore: this.deps.projectStore,
+              logger: this.deps.logger,
+            })
+          : null);
+
+      if (memoryProvider) {
+        const promptText = [task.title, task.description].filter(Boolean).join('\n\n') || task.title;
+        const memoryResult = memoryProvider.buildContext({
+          identity,
+          queryText: promptText,
+          projectId: task.project_id ?? identity.project_id,
+          agentId: agentProfile.agent_id,
+        });
+        if (memoryResult.injected && memoryResult.text) {
+          taskMemoryContext = memoryResult.text;
+        }
+      }
+    }
+
     const modelName: string =
       agentProfile.model_preference ||
       options.modelOverride ||
       this.deps.config.defaultModel;
-    const systemPrompt = this.buildSystemPrompt(agentProfile, options.prebuiltSystemMessage);
+    const systemPrompt = this.buildSystemPrompt(
+      agentProfile,
+      options.prebuiltSystemMessage,
+      taskMemoryContext,
+    );
     const initialMessages = chatHistoryToAgentMessages(options.historyMessages, modelName);
 
     const agent = createZhiyiOpenClawAgent({

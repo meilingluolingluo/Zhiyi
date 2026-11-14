@@ -202,10 +202,18 @@ export class MemoryStore {
       conditions.push('category = ?');
       params.push(filters.category);
     }
-    const limit: number = Math.min(Math.max(filters.limit ?? 50, 1), 200);
+    if (filters.source !== undefined) {
+      if (filters.source === 'candidate') {
+        conditions.push("source LIKE 'candidate:%'");
+      } else {
+        conditions.push('source = ?');
+        params.push(filters.source);
+      }
+    }
+    const limit: number = Math.min(Math.max(filters.limit ?? 20, 1), 100);
     const offset: number = Math.max(filters.offset ?? 0, 0);
     const sql: string = `SELECT * FROM memories WHERE ${conditions.join(' AND ')}
-      ORDER BY updated_at DESC LIMIT ? OFFSET ?`;
+      ORDER BY updated_at DESC, memory_id DESC LIMIT ? OFFSET ?`;
     return this.db.all<RawMemoryRow>(sql, [...params, limit, offset]).map(rowToMemory);
   }
 
@@ -332,6 +340,14 @@ export class MemoryStore {
     if (filters.category !== undefined) {
       conditions.push('category = ?');
       params.push(filters.category);
+    }
+    if (filters.source !== undefined) {
+      if (filters.source === 'candidate') {
+        conditions.push("source LIKE 'candidate:%'");
+      } else {
+        conditions.push('source = ?');
+        params.push(filters.source);
+      }
     }
     const row = this.db.get<{ total: number }>(
       `SELECT COUNT(*) AS total FROM memories WHERE ${conditions.join(' AND ')}`,

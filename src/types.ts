@@ -16,6 +16,13 @@ export type MemoryCategory =
   | 'general';
 export type CandidateStatus = 'pending' | 'low_confidence' | 'approved' | 'rejected';
 
+export const CANDIDATE_STATUSES: readonly CandidateStatus[] = [
+  'pending',
+  'low_confidence',
+  'approved',
+  'rejected',
+];
+
 export const MEMORY_TYPES: readonly MemoryType[] = [
   'identity',
   'episodic',
@@ -120,6 +127,7 @@ export interface MemoryFilters {
   scope?: MemoryScope;
   category?: MemoryCategory;
   status?: MemoryStatus;
+  source?: string;
   include_archived?: boolean;
   limit?: number;
   offset?: number;
@@ -241,6 +249,8 @@ export interface MemoryCandidate {
   confidence: number;
   status: CandidateStatus;
   created_memory_id: string | null;
+  entities?: string[];
+  evolution_relation?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -253,6 +263,9 @@ export interface ExtractedCandidate {
   content: string;
   confidence: number;
   reason: string;
+  event?: 'ADD' | 'UPDATE' | 'SUPPLEMENT' | 'DELETE' | 'NONE';
+  old_memory_id?: string | null;
+  entities?: string[];
 }
 
 /** OpenAI Chat Completions 消息。保留索引签名以完整透传扩展字段。 */

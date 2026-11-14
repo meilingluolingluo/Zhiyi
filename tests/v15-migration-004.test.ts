@@ -304,6 +304,9 @@ describe('Migration 004 (V1.5 Phase 1)', () => {
 
     db.exec(`
       BEGIN TRANSACTION;
+      ALTER TABLE memory_candidates DROP COLUMN entities;
+      ALTER TABLE memory_candidates DROP COLUMN evolution_relation;
+      DELETE FROM schema_migrations WHERE version = '009_memory_extraction_pipeline';
       DROP INDEX IF EXISTS idx_task_deps_depends_on;
       DROP INDEX IF EXISTS idx_task_deps_task;
       DROP TABLE IF EXISTS task_dependencies;

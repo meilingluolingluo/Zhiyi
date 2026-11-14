@@ -64,6 +64,11 @@ const CHOICE_SLOTS: ReadonlyArray<{
     slotTerms: ['框架', 'web', '后端', '前端', 'ui'],
     candidates: ['react', 'vue', 'svelte', 'express', 'fastify', 'nextjs', 'django', 'fastapi'],
   },
+  {
+    slot: 'api_protocol',
+    slotTerms: ['接口', 'api', '协议', '规范', '通信', '架构'],
+    candidates: ['graphql', 'restful', 'grpc', 'trpc'],
+  },
 ];
 
 const POSITIVE_MARKERS: readonly string[] = ['偏好', '喜欢', '倾向', '采用', '使用', '首选', '优先', '坚持'];
@@ -95,7 +100,12 @@ export function isDuplicateContent(aText: string, bText: string): boolean {
   const normA = normalizeContent(aText);
   const normB = normalizeContent(bText);
   if (!normA || !normB) return false;
-  if (normA === normB || normA.includes(normB) || normB.includes(normA)) return true;
+  if (normA === normB) return true;
+  const minLen = Math.min(normA.length, normB.length);
+  const maxLen = Math.max(normA.length, normB.length);
+  if (minLen > 0 && maxLen / minLen <= 1.2 && (normA.includes(normB) || normB.includes(normA))) {
+    return true;
+  }
   const tokensA = tokenize(aText).filter((t) => t.length >= 2);
   const tokensB = tokenize(bText).filter((t) => t.length >= 2);
   return tokensA.length >= 3 && tokensB.length >= 3 && jaccardSimilarity(tokensA, tokensB) >= 0.85;
@@ -171,6 +181,143 @@ export function findConflictingMemory(
     }
   }
   return undefined;
+}
+
+const OUTDATED_MARKERS: readonly string[] = [
+  '废弃',
+  '已废弃',
+  '弃用',
+  '已弃用',
+  '下线',
+  '已下线',
+  '废除',
+  '取消使用',
+  '淘汰',
+  '作废',
+];
+
+const MERGE_MARKERS: readonly string[] = ['合并', '整合', '汇总', '梳理整合', '融合'];
+
+export type EvolutionRelationType =
+  | 'new'
+  | 'duplicate'
+  | 'supplement'
+  | 'conflict'
+  | 'outdated'
+  | 'merge';
+
+export interface EvolutionRelationResult {
+  relation: EvolutionRelationType;
+  relatedMemory: Memory | null;
+  suggestion: string;
+  reason?: string;
+  action: 'create' | 'merge' | 'supplement' | 'supersede' | 'archive';
+}
+
+/**
+ * 分析候选内容与已有正式记忆的进化演进关系（全新/重复/补充/冲突/过时废弃/融合合并）。
+ */
+export function findEvolutionRelation(
+  candidateText: string,
+  bucket: {
+    scope: MemoryScope;
+    agent_id?: string | null;
+    project_id?: string | null;
+    category?: MemoryCategory;
+  },
+  existingMemories: readonly Memory[],
+): EvolutionRelationResult {
+  const nowMs = Date.now();
+  const activeBucket = existingMemories.filter(
+    (m) =>
+      m.status === 'active' &&
+      !isMemoryExpired(m, nowMs) &&
+      sameIsolationBucket(m, {
+        scope: bucket.scope,
+        agent_id: bucket.agent_id ?? null,
+        project_id: bucket.project_id ?? null,
+      }),
+  );
+
+  const duplicate = activeBucket.find((m) => isDuplicateContent(candidateText, m.content));
+  if (duplicate) {
+    return {
+      relation: 'duplicate',
+      relatedMemory: duplicate,
+      suggestion: `与已有记忆(${duplicate.memory_id})内容重复，无需重复保存`,
+      action: 'merge',
+    };
+  }
+
+  const isOutdated = OUTDATED_MARKERS.some((m) => candidateText.includes(m));
+  const candTokens = tokenize(candidateText).filter((t) => t.length >= 2);
+  if (isOutdated) {
+    for (const existing of activeBucket) {
+      const existTokens = tokenize(existing.content).filter((t) => t.length >= 2);
+      const overlap = jaccardSimilarity(candTokens, existTokens);
+      const hasSlotMatch = CHOICE_SLOTS.some((slot) => {
+        const existChoice = extractSlotChoice(existing.content, slot);
+        return existChoice && candidateText.toLowerCase().includes(existChoice);
+      });
+      if (overlap >= 0.2 || hasSlotMatch) {
+        return {
+          relation: 'outdated',
+          relatedMemory: existing,
+          suggestion: `与已有记忆(${existing.memory_id})关联的方案/事实已声明废弃，建议归档`,
+          reason: `检测到废弃标识并关联已有记忆 ${existing.memory_id}`,
+          action: 'archive',
+        };
+      }
+    }
+  }
+
+  const conflict = findConflictingMemory(candidateText, bucket, activeBucket);
+  if (conflict) {
+    return {
+      relation: 'conflict',
+      relatedMemory: conflict.memory,
+      suggestion: `与已有记忆(${conflict.memory.memory_id})存在偏好或决策冲突：${conflict.reason}`,
+      reason: conflict.reason,
+      action: 'supersede',
+    };
+  }
+
+  const candPolarity = polarityOf(candidateText);
+
+  for (const existing of activeBucket) {
+    const existTokens = tokenize(existing.content).filter((t) => t.length >= 2);
+    const overlap = jaccardSimilarity(candTokens, existTokens);
+    if (overlap >= 0.25 && overlap < 0.85) {
+      const existPolarity = polarityOf(existing.content);
+      if (
+        candPolarity === existPolarity ||
+        candPolarity === 'neutral' ||
+        existPolarity === 'neutral'
+      ) {
+        if (overlap >= 0.65 || MERGE_MARKERS.some((m) => candidateText.includes(m))) {
+          return {
+            relation: 'merge',
+            relatedMemory: existing,
+            suggestion: `与已有记忆(${existing.memory_id})高度重叠，建议融合成完整表述并合并证据`,
+            action: 'merge',
+          };
+        }
+        return {
+          relation: 'supplement',
+          relatedMemory: existing,
+          suggestion: `与已有记忆(${existing.memory_id})高度关联，建议作为补充或合并更新`,
+          action: 'supplement',
+        };
+      }
+    }
+  }
+
+  return {
+    relation: 'new',
+    relatedMemory: null,
+    suggestion: '属于全新独立记忆，建议批准入库',
+    action: 'create',
+  };
 }
 
 /** 在调用方已持有的事务内执行记忆进化写入，避免 SQLite 嵌套 BEGIN IMMEDIATE。 */

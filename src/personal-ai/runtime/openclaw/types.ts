@@ -20,10 +20,10 @@ export interface OpenClawBackendConfig {
 
 export interface ZhiyiToolContext {
   userId: string;
-  agent: AgentProfile;
-  task: BusinessTask;
-  execution: ExecutionTask;
-  identity: PersonalAIIdentity;
+  agent?: AgentProfile;
+  task?: BusinessTask;
+  execution?: ExecutionTask;
+  identity?: PersonalAIIdentity;
   allowedTools: ReadonlySet<string>;
   /** 可选公共访问前缀（用于拼接生图 URL）。 */
   publicOrigin?: string;
@@ -73,6 +73,9 @@ export interface OpenClawAgentRunnerDeps {
   businessTaskManager: BusinessTaskManager;
   toolGateway: import('./tool-gateway').ZhiyiToolGateway;
   logger: Logger;
+  agentStore?: import('../../../agents').AgentStore;
+  projectStore?: import('../../domain/project-store').ProjectStore;
+  memoryContextProvider?: import('../memory/context-provider').MemoryContextProvider;
 }
 
 export function isOpenClawAgent(agent: Pick<AgentProfile, 'execution_backend' | 'backend_config'>): boolean {

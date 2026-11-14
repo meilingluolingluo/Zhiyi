@@ -5,6 +5,7 @@
 import type { AgentStore } from '../../agents';
 import type { CandidateStore } from '../../candidates';
 import type { MemoryStore } from '../../memories';
+import type { TrajectoryStore } from '../../trajectories';
 import type { AgentProfile, ChatMessage } from '../../types';
 import type { BusinessTaskDetail, BusinessTaskManager } from '../task/business-task-manager';
 import type { GoalStore } from './goal-store';
@@ -34,13 +35,17 @@ export interface WorkOperationsDeps {
   agentStore: AgentStore;
   candidateStore?: CandidateStore;
   memoryStore?: MemoryStore;
+  trajectoryStore?: TrajectoryStore;
 }
 
 /**
  * 任务完成后沉淀经验与结论到候选记忆（不复制易变业务状态，仅保留有实质产出的总结）。
  */
 export function recordTaskCompletionCandidate(
-  deps: Pick<WorkOperationsDeps, 'businessTaskManager' | 'projectStore' | 'candidateStore' | 'memoryStore'>,
+  deps: Pick<
+    WorkOperationsDeps,
+    'businessTaskManager' | 'projectStore' | 'candidateStore' | 'memoryStore' | 'trajectoryStore'
+  >,
   params: { userId: string; taskId: string; agentId?: string | null; result: string },
 ): void {
   if (!deps.candidateStore || !deps.memoryStore) return;
@@ -54,6 +59,26 @@ export function recordTaskCompletionCandidate(
     ? deps.projectStore.listGoalsForProject(params.userId, task.project_id).map((g) => g.id)
     : [];
   const snippet = `任务「${task.title}」结论与经验：${cleanedResult.slice(0, 260)}`;
+
+  let trajectoryId: string | null = null;
+  let evidenceTrajectoryIds: string[] = [];
+  if (deps.trajectoryStore) {
+    const saved = deps.trajectoryStore.save({
+      request_id: `task_comp_${task.id}_${Date.now()}`,
+      user_id: params.userId,
+      agent_id: params.agentId ?? task.assignee_agent_id ?? 'system',
+      session_id: undefined,
+      task_id: task.id,
+      project_id: task.project_id ?? undefined,
+      model: 'task-runner',
+      request: JSON.stringify({ task_id: task.id, title: task.title, description: task.description }),
+      response: cleanedResult,
+      status: 'ok',
+    });
+    trajectoryId = saved.record.id;
+    evidenceTrajectoryIds = [saved.record.id];
+  }
+
   deps.candidateStore.create(
     {
       user_id: params.userId,
@@ -68,6 +93,8 @@ export function recordTaskCompletionCandidate(
       source: 'work-completion',
       confidence: 0.78,
       status: 'pending',
+      trajectory_id: trajectoryId,
+      evidence_trajectory_ids: evidenceTrajectoryIds,
     },
     deps.memoryStore,
   );
@@ -75,7 +102,10 @@ export function recordTaskCompletionCandidate(
 
 /** 项目完成时提炼项目级关键结论候选，供后续同类项目或关联目标参考。 */
 export function recordProjectCompletionCandidate(
-  deps: Pick<WorkOperationsDeps, 'projectStore' | 'businessTaskManager' | 'candidateStore' | 'memoryStore'>,
+  deps: Pick<
+    WorkOperationsDeps,
+    'projectStore' | 'businessTaskManager' | 'candidateStore' | 'memoryStore' | 'trajectoryStore'
+  >,
   userId: string,
   project: Project,
 ): void {
@@ -97,6 +127,25 @@ export function recordProjectCompletionCandidate(
         : '';
   if (summary.length < 18) return;
 
+  let trajectoryId: string | null = null;
+  let evidenceTrajectoryIds: string[] = [];
+  if (deps.trajectoryStore) {
+    const saved = deps.trajectoryStore.save({
+      request_id: `proj_comp_${project.id}_${Date.now()}`,
+      user_id: userId,
+      agent_id: 'system',
+      session_id: undefined,
+      task_id: undefined,
+      project_id: project.id,
+      model: 'project-runner',
+      request: JSON.stringify({ project_id: project.id, title: project.title, description: project.description }),
+      response: summary,
+      status: 'ok',
+    });
+    trajectoryId = saved.record.id;
+    evidenceTrajectoryIds = [saved.record.id];
+  }
+
   deps.candidateStore.create(
     {
       user_id: userId,
@@ -109,6 +158,8 @@ export function recordProjectCompletionCandidate(
       source: 'project-completion',
       confidence: 0.8,
       status: 'pending',
+      trajectory_id: trajectoryId,
+      evidence_trajectory_ids: evidenceTrajectoryIds,
     },
     deps.memoryStore,
   );
@@ -190,7 +241,7 @@ export function createProjectForUser(
 export function updateProjectForUser(
   deps: Pick<
     WorkOperationsDeps,
-    'projectStore' | 'businessTaskManager' | 'candidateStore' | 'memoryStore'
+    'projectStore' | 'businessTaskManager' | 'candidateStore' | 'memoryStore' | 'trajectoryStore'
   >,
   userId: string,
   projectId: string,

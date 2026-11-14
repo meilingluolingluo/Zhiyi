@@ -1,14 +1,17 @@
 /** 候选记忆：自动提取与工作复盘产物，按用户审批或可信合并策略进入正式记忆库。 */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Database } from './db';
 import { normalizeContent } from './extraction-rules';
 import { normalizeMemoryCategory, parseEvidenceTrajectoryIds, type MemoryStore } from './memories';
 import {
   evolveMemoryWriteInTx,
   findConflictingMemory,
+  findEvolutionRelation,
   isDuplicateContent,
 } from './memory-evolution';
+import { DomainError } from './personal-ai/domain/types';
 import {
+  MEMORY_CATEGORIES,
   MEMORY_SCOPES,
   MEMORY_TYPES,
   type CandidateStatus,
@@ -19,6 +22,20 @@ import {
   type MemoryScope,
   type MemoryType,
 } from './types';
+
+/** 计算标准化正文的 SHA-256 哈希值，用于批内精确去重（Mem0 V3 Hash Deduplication）。 */
+export function createContentHash(content: string): string {
+  const normalized = normalizeContent(content).toLowerCase().replace(/\s+/g, ' ').trim();
+  return createHash('sha256').update(normalized).digest('hex');
+}
+
+export interface CandidatePatch {
+  content?: string;
+  category?: MemoryCategory;
+  scope?: MemoryScope;
+  type?: MemoryType;
+  confidence?: number;
+}
 
 export interface NewCandidate {
   user_id: string;
@@ -35,6 +52,9 @@ export interface NewCandidate {
   evidence_trajectory_ids?: string[];
   confidence: number;
   status?: CandidateStatus;
+  entities?: string[];
+  evolution_relation?: string | null;
+  conflict_memory_id?: string | null;
 }
 
 export interface CandidateFilters {
@@ -64,7 +84,23 @@ function normalizeScope(value: unknown): MemoryScope {
   return MEMORY_SCOPES.includes(value as MemoryScope) ? (value as MemoryScope) : 'personal';
 }
 
-function rowToCandidate(row: MemoryCandidate & { evidence_trajectory_ids?: string | string[] }): MemoryCandidate {
+function parseEntities(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String);
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {}
+  }
+  return [];
+}
+
+function rowToCandidate(
+  row: MemoryCandidate & {
+    evidence_trajectory_ids?: string | string[];
+    entities?: string | string[];
+  },
+): MemoryCandidate {
   return {
     ...row,
     agent_id: row.agent_id ?? null,
@@ -77,6 +113,8 @@ function rowToCandidate(row: MemoryCandidate & { evidence_trajectory_ids?: strin
     conflict_memory_id: row.conflict_memory_id ?? null,
     created_memory_id: row.created_memory_id ?? null,
     confidence: Number(row.confidence),
+    entities: parseEntities(row.entities),
+    evolution_relation: row.evolution_relation ?? null,
   };
 }
 
@@ -115,7 +153,7 @@ export class CandidateStore {
     const now: string = new Date().toISOString();
     const scope = normalizeScope(input.scope);
     const category = normalizeMemoryCategory(input.category);
-    const conflict = findConflictingMemory(
+    const relationResult = findEvolutionRelation(
       input.content,
       {
         scope,
@@ -125,6 +163,13 @@ export class CandidateStore {
       },
       memoryStore.allForUser(input.user_id, false),
     );
+    const conflictMemoryId =
+      input.conflict_memory_id !== undefined
+        ? input.conflict_memory_id
+        : relationResult.relatedMemory?.memory_id ?? null;
+    const evolutionRelation = input.evolution_relation ?? relationResult.relation;
+    const entities = Array.isArray(input.entities) ? input.entities : [];
+
     const evidenceIds: string[] = [];
     if (input.trajectory_id && input.trajectory_id.trim() !== '') {
       evidenceIds.push(input.trajectory_id.trim());
@@ -150,18 +195,20 @@ export class CandidateStore {
       source: input.source ?? 'auto-extract',
       trajectory_id: input.trajectory_id ?? null,
       evidence_trajectory_ids: evidenceIds,
-      conflict_memory_id: conflict?.memory.memory_id ?? null,
+      conflict_memory_id: conflictMemoryId,
       confidence: Math.min(1, Math.max(0, Number(input.confidence) || 0)),
       status: input.status ?? 'pending',
       created_memory_id: null,
+      entities,
+      evolution_relation: evolutionRelation,
       created_at: now,
       updated_at: now,
     };
     this.db.run(
       `INSERT INTO memory_candidates
        (id, user_id, agent_id, project_id, goal_id, task_id, type, scope, category, content, source,
-        trajectory_id, evidence_trajectory_ids, conflict_memory_id, confidence, status, created_memory_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        trajectory_id, evidence_trajectory_ids, conflict_memory_id, confidence, status, created_memory_id, entities, evolution_relation, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
       [
         candidate.id,
         candidate.user_id,
@@ -179,6 +226,8 @@ export class CandidateStore {
         candidate.conflict_memory_id,
         candidate.confidence,
         candidate.status,
+        JSON.stringify(candidate.entities ?? []),
+        candidate.evolution_relation,
         candidate.created_at,
         candidate.updated_at,
       ],
@@ -201,7 +250,7 @@ export class CandidateStore {
       conditions.push('status = ?');
       params.push(filters.status);
     }
-    const limit: number = Math.min(Math.max(filters.limit ?? 50, 1), 200);
+    const limit: number = Math.min(Math.max(filters.limit ?? 20, 1), 100);
     const offset: number = Math.max(filters.offset ?? 0, 0);
     return this.db
       .all<MemoryCandidate>(
@@ -227,11 +276,78 @@ export class CandidateStore {
   }
 
   /**
-   * 幂等审批入库：用户审批通过后标记 verified_by_user=true，并在同事务内处理去重合并与冲突替代。
+   * 修改候选记忆。
+   * 支持编辑正文、分类、作用域与类型；严格保留原有证据链（trajectory_id 与 evidence_trajectory_ids）。
    */
-  approve(userId: string, id: string, memoryStore: MemoryStore): ApproveResult {
+  update(
+    userId: string,
+    id: string,
+    patch: CandidatePatch,
+    memoryStore: MemoryStore,
+  ): MemoryCandidate {
+    const existing = this.get(userId, id);
+    if (!existing) {
+      throw new DomainError(404, 'candidate_not_found', '候选记忆不存在或无权访问');
+    }
+    if (existing.status === 'approved' || existing.status === 'rejected') {
+      throw new DomainError(409, 'candidate_immutable', '已审批或已拒绝的候选记忆不可修改');
+    }
+
+    const nextContent = typeof patch.content === 'string' ? patch.content.trim() : existing.content;
+    if (nextContent.length < 4) {
+      throw new DomainError(400, 'invalid_content', '记忆内容至少需要 4 个字符');
+    }
+    const nextScope = patch.scope && MEMORY_SCOPES.includes(patch.scope) ? patch.scope : existing.scope;
+    const nextCategory = patch.category && MEMORY_CATEGORIES.includes(patch.category) ? patch.category : existing.category;
+    const nextType = patch.type && MEMORY_TYPES.includes(patch.type) ? patch.type : existing.type;
+    const nextConfidence = typeof patch.confidence === 'number'
+      ? Math.min(1, Math.max(0, patch.confidence))
+      : existing.confidence;
+
+    const conflict = findConflictingMemory(
+      nextContent,
+      {
+        scope: nextScope,
+        agent_id: existing.agent_id,
+        project_id: existing.project_id,
+        category: nextCategory,
+      },
+      memoryStore.allForUser(userId, false),
+    );
+
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE memory_candidates
+       SET content = ?, scope = ?, category = ?, type = ?, confidence = ?, conflict_memory_id = ?, updated_at = ?
+       WHERE id = ? AND user_id = ?`,
+      [
+        nextContent,
+        nextScope,
+        nextCategory,
+        nextType,
+        nextConfidence,
+        conflict?.memory.memory_id ?? null,
+        now,
+        id,
+        userId,
+      ],
+    );
+
+    return this.get(userId, id)!;
+  }
+
+  /**
+   * 幂等审批入库：用户审批通过后标记 verified_by_user=true，并在同事务内处理去重合并与冲突替代。
+   * 支持传入候选字段修改覆盖项（overrides），在入库前原子应用编辑。
+   */
+  approve(
+    userId: string,
+    id: string,
+    memoryStore: MemoryStore,
+    overrides?: CandidatePatch,
+  ): ApproveResult {
     return this.db.transaction((): ApproveResult => {
-      const candidate: MemoryCandidate | undefined = this.get(userId, id);
+      let candidate: MemoryCandidate | undefined = this.get(userId, id);
       if (!candidate) return { ok: false, idempotent: false, reason: 'not_found' };
       if (candidate.status === 'approved') {
         const memory: Memory | undefined = candidate.created_memory_id
@@ -241,6 +357,10 @@ export class CandidateStore {
       }
       if (candidate.status === 'rejected') {
         return { ok: false, idempotent: false, reason: 'rejected', candidate };
+      }
+
+      if (overrides && Object.keys(overrides).length > 0) {
+        candidate = this.update(userId, id, overrides, memoryStore);
       }
 
       const evidenceTrajectoryIds: string[] = [];
@@ -253,6 +373,38 @@ export class CandidateStore {
             evidenceTrajectoryIds.push(tid.trim());
           }
         }
+      }
+
+      if (candidate.evolution_relation === 'outdated' && candidate.conflict_memory_id) {
+        memoryStore.archive(userId, candidate.conflict_memory_id);
+        const auditMemory = memoryStore.create({
+          user_id: userId,
+          agent_id: candidate.agent_id,
+          project_id: candidate.project_id,
+          goal_id: candidate.goal_id,
+          task_id: candidate.task_id,
+          type: candidate.type,
+          scope: candidate.scope,
+          category: candidate.category,
+          content: candidate.content,
+          source: `candidate:${candidate.id}`,
+          confidence: candidate.confidence,
+          evidence_trajectory_ids: evidenceTrajectoryIds,
+          verified_by_user: true,
+          status: 'archived',
+        });
+        this.db.run(
+          `UPDATE memory_candidates
+           SET status = 'approved', created_memory_id = ?, updated_at = ?
+           WHERE id = ? AND user_id = ?`,
+          [auditMemory.memory_id, new Date().toISOString(), id, userId],
+        );
+        return {
+          ok: true,
+          idempotent: false,
+          memory: auditMemory,
+          candidate: this.get(userId, id),
+        };
       }
 
       const evolved = evolveMemoryWriteInTx(
@@ -322,10 +474,28 @@ export class CandidateStore {
     memoryStore: MemoryStore,
   ): number {
     let created = 0;
+    const seenHashes = new Set<string>();
+
     for (const item of items) {
       if (!item || typeof item.content !== 'string' || item.content.trim().length < 6) continue;
       const confidence: number = Number(item.confidence);
       if (!Number.isFinite(confidence)) continue;
+
+      const contentHash = createContentHash(item.content);
+      if (seenHashes.has(contentHash)) continue;
+      seenHashes.add(contentHash);
+
+      let evolutionRelation: string | null = null;
+      if (item.event === 'DELETE') {
+        evolutionRelation = 'outdated';
+      } else if (item.event === 'UPDATE') {
+        evolutionRelation = 'conflict';
+      } else if (item.event === 'SUPPLEMENT') {
+        evolutionRelation = 'supplement';
+      } else if (item.event === 'ADD') {
+        evolutionRelation = 'new';
+      }
+
       const result: CreateResult = this.create(
         {
           user_id: context.user_id,
@@ -341,6 +511,9 @@ export class CandidateStore {
           trajectory_id: context.trajectory_id,
           confidence,
           status: confidence < context.minConfidence ? 'low_confidence' : 'pending',
+          entities: item.entities ?? [],
+          evolution_relation: evolutionRelation,
+          conflict_memory_id: item.old_memory_id ?? undefined,
         },
         memoryStore,
       );

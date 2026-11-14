@@ -5,19 +5,19 @@
  * 用户身份由服务端决定，且不把全部历史无差别塞入提示词。
  */
 import type { AgentStore } from '../../agents';
-import { buildMemoryContext, extractTaskText, injectMemoryMessages } from '../../context';
+import { extractTaskText, injectMemoryMessages } from '../../context';
 import type { AppConfig } from '../../config';
 import type { MemoryStore } from '../../memories';
 import { tokenize } from '../../search';
 import type { ChatMessage, SearchHit } from '../../types';
 import type { PersonalAIIdentity } from '../identity/identity-manager';
-import type { ResolvedIdentity } from '../../identity';
 import type { GoalStore } from '../domain/goal-store';
 import type { ProjectStore } from '../domain/project-store';
 import type { BusinessTask, Goal, Project, UserProfile } from '../domain/types';
 import type { UserProfileStore } from '../domain/user-profile-store';
 import type { ProactiveNotification, ProactiveStore } from '../proactive/proactive-store';
 import type { BusinessTaskManager } from '../task/business-task-manager';
+import { MemoryContextProvider, MemoryService } from './memory';
 
 export interface ContextBuilderDeps {
   config: AppConfig;
@@ -28,6 +28,8 @@ export interface ContextBuilderDeps {
   projectStore?: ProjectStore;
   businessTaskManager?: BusinessTaskManager;
   proactiveStore?: ProactiveStore;
+  memoryService?: MemoryService;
+  memoryContextProvider?: MemoryContextProvider;
 }
 
 export interface BuiltContext {
@@ -288,16 +290,22 @@ export function buildPersonalAIContext(
   }
 
   const memoryEnabledByUser: boolean = userProfile?.preferences?.memory_injection_enabled !== false;
-  // PersonalAIIdentity 是 ResolvedIdentity 的超集，结构类型直接兼容。
-  const memory = memoryEnabledByUser
-    ? buildMemoryContext({
-        config: deps.config,
-        memoryStore: deps.memoryStore,
-        agentStore: deps.agentStore,
-        identity: identity as unknown as ResolvedIdentity,
-        messages,
-      })
-    : { injected: false, systemMessage: '', hits: [] as SearchHit[] };
+  const memoryProvider =
+    deps.memoryContextProvider ??
+    new MemoryContextProvider({
+      config: deps.config,
+      memoryService:
+        deps.memoryService ?? new MemoryService({ memoryStore: deps.memoryStore }),
+      agentStore: deps.agentStore,
+      projectStore: deps.projectStore,
+    });
+
+  const memory = memoryProvider.buildContext({
+    identity,
+    queryText: taskText,
+    projectId: identityProjectId,
+    enabled: memoryEnabledByUser,
+  });
 
   const proactiveEnabled: boolean = userProfile?.preferences?.proactive_enabled !== false;
   const unreadAlerts: ProactiveNotification[] =
@@ -306,7 +314,7 @@ export function buildPersonalAIContext(
       : [];
 
   const parts: string[] = [PERSONAL_AI_INSTRUCTION];
-  if (memory.injected && memory.systemMessage) parts.push(memory.systemMessage);
+  if (memory.injected && memory.text) parts.push(memory.text);
   const workspaceSummary: string = formatWorkspaceSummary(
     userProfile,
     activeGoals,

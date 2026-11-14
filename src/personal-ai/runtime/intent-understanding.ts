@@ -15,10 +15,37 @@ export interface IntentResult {
   requestedAgentId?: string;
 }
 
-const GREETING_ONLY: RegExp = /^(你好|hi|hello|hey|在吗|谢谢|thanks|再见)[\s!！。,.~]*$/i;
+const GREETING_TOKENS: readonly string[] = [
+  '你好',
+  '您好',
+  'hi',
+  'hello',
+  'hey',
+  '在吗',
+  '在么',
+  '早上好',
+  '下午好',
+  '晚上好',
+  '谢谢',
+  '多谢',
+  'thanks',
+  '再见',
+  '拜拜',
+  '哈喽',
+  '啊',
+  '呀',
+  '吧',
+  '哈',
+];
 
 export function isGreetingOnly(text: string): boolean {
-  return GREETING_ONLY.test((text ?? '').toLowerCase().trim());
+  let cleaned = (text ?? '').toLowerCase().trim();
+  cleaned = cleaned.replace(/[\s!！?？。,.~，。！？～·、]+/g, '');
+  if (cleaned === '') return true;
+  for (const token of GREETING_TOKENS) {
+    cleaned = cleaned.replaceAll(token, '');
+  }
+  return cleaned === '';
 }
 
 export type StructuredIntentAction =

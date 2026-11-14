@@ -48,6 +48,8 @@ import { buildPersonalAIContext, type BuiltContext } from './context-builder';
 import type { ButlerCoordinator } from './butler-coordinator';
 import type { DirectExecutionRunner } from './direct-execution-runner';
 import type { OpenClawAgentRunner } from './openclaw/agent-runner';
+import { redactSensitiveText, type ZhiyiToolGateway } from './openclaw/tool-gateway';
+import type { ZhiyiToolContext } from './openclaw/types';
 import { isOpenClawAgent } from './openclaw/types';
 import { planExecution } from './execution-planner';
 import {
@@ -86,6 +88,7 @@ export interface RuntimeDeps {
   directRunner?: DirectExecutionRunner;
   openClawRunner?: OpenClawAgentRunner;
   butlerCoordinator?: ButlerCoordinator;
+  toolGateway?: ZhiyiToolGateway;
 }
 
 export interface RunInput {
@@ -134,8 +137,19 @@ export class PersonalAIRuntime {
     model: string | undefined,
   ): void {
     if (assistantText.trim() === '') return;
+    const prompt = lastUserPrompt(messages);
+    if (prompt && isGreetingOnly(prompt)) {
+      return;
+    }
     this.deps.background.run(async (): Promise<void> => {
       try {
+        const sanitizedMessages = messages.map((m) => {
+          if (typeof m.content === 'string') {
+            return { ...m, content: redactSensitiveText(m.content) };
+          }
+          return m;
+        });
+        const sanitizedAssistantText = redactSensitiveText(assistantText);
         const saved = this.deps.trajectoryStore.save({
           request_id: identity.request_id,
           user_id: identity.user_id,
@@ -144,15 +158,15 @@ export class PersonalAIRuntime {
           task_id: identity.task_id,
           project_id: identity.project_id,
           model: model || this.deps.config.defaultModel,
-          request: JSON.stringify({ messages }),
-          response: assistantText,
+          request: JSON.stringify({ messages: sanitizedMessages }),
+          response: sanitizedAssistantText,
           status: 'ok',
         });
         if (!saved.inserted || !this.deps.config.memoryAutoExtract) return;
         this.deps.queue.enqueue({
           trajectory: saved.record,
-          messages,
-          assistantText,
+          messages: sanitizedMessages,
+          assistantText: sanitizedAssistantText,
           source: 'auto-extract',
         });
       } catch (error) {
@@ -297,6 +311,7 @@ export class PersonalAIRuntime {
     usageOut: TokenUsage | undefined,
     capture: { text: string },
     publicOrigin?: string,
+    identity?: PersonalAIIdentity,
   ): AsyncGenerator<PersonalAIEvent> {
     const effectiveModel = modelName || this.deps.config.defaultModel;
     const shouldGenerateImage =
@@ -337,15 +352,192 @@ export class PersonalAIRuntime {
       return;
     }
 
-    for await (const delta of this.deps.modelAdapter.stream(context.messages, {
-      model: modelName,
-      signal,
-      onUsage: (usage: TokenUsage): void => {
-        if (usageOut) Object.assign(usageOut, usage);
+    if (!this.deps.toolGateway || !identity) {
+      for await (const delta of this.deps.modelAdapter.stream(context.messages, {
+        model: modelName,
+        signal,
+        onUsage: (usage: TokenUsage): void => {
+          if (usageOut) Object.assign(usageOut, usage);
+        },
+      })) {
+        capture.text += delta;
+        yield { type: 'text_delta', content: delta };
+      }
+      return;
+    }
+
+    const memoryToolNames = new Set([
+      'recall_memory',
+      'remember_memory',
+      'update_memory',
+      'memory_search',
+      'memory_get',
+    ]);
+    const registeredTools = this.deps.toolGateway
+      .listRegisteredTools()
+      .filter((tool) => memoryToolNames.has(tool.name));
+
+    if (registeredTools.length === 0) {
+      for await (const delta of this.deps.modelAdapter.stream(context.messages, {
+        model: modelName,
+        signal,
+        onUsage: (usage: TokenUsage): void => {
+          if (usageOut) Object.assign(usageOut, usage);
+        },
+      })) {
+        capture.text += delta;
+        yield { type: 'text_delta', content: delta };
+      }
+      return;
+    }
+
+    const openAiTools = registeredTools.map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters as Record<string, unknown>,
       },
-    })) {
-      capture.text += delta;
-      yield { type: 'text_delta', content: delta };
+    }));
+
+    const toolCtx: ZhiyiToolContext = {
+      userId: identity.user_id,
+      identity,
+      allowedTools: memoryToolNames,
+      publicOrigin,
+    };
+
+    const currentMessages: ChatMessage[] = [...context.messages];
+    const maxToolTurns = 3;
+
+    for (let turn = 0; turn < maxToolTurns; turn += 1) {
+      if (signal?.aborted) break;
+
+      const { response } = await this.deps.modelAdapter.openRawStream(
+        {
+          model: modelName,
+          messages: currentMessages,
+          tools: openAiTools,
+        },
+        { signal },
+      );
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let turnAssistantText = '';
+      const toolStates = new Map<number, { id: string; name: string; argsJson: string }>();
+
+      try {
+        while (true) {
+          if (signal?.aborted) break;
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (data === '' || data === '[DONE]') continue;
+
+            let parsed: any;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              continue;
+            }
+
+            if (parsed.usage && usageOut) {
+              const inTok = Number(parsed.usage.prompt_tokens ?? 0);
+              const outTok = Number(parsed.usage.completion_tokens ?? 0);
+              const totTok = Number(parsed.usage.total_tokens ?? inTok + outTok);
+              usageOut.prompt_tokens += inTok;
+              usageOut.completion_tokens += outTok;
+              usageOut.total_tokens += totTok;
+            }
+
+            const choice = parsed.choices?.[0];
+            if (!choice) continue;
+
+            const delta = choice.delta;
+            if (!delta) continue;
+
+            if (typeof delta.content === 'string' && delta.content !== '') {
+              turnAssistantText += delta.content;
+              capture.text += delta.content;
+              yield { type: 'text_delta', content: delta.content };
+            }
+
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                const idx = typeof tc.index === 'number' ? tc.index : 0;
+                let state = toolStates.get(idx);
+                if (!state) {
+                  state = {
+                    id: typeof tc.id === 'string' && tc.id !== '' ? tc.id : `call_${Date.now()}_${idx}`,
+                    name: tc.function?.name ?? '',
+                    argsJson: '',
+                  };
+                  toolStates.set(idx, state);
+                }
+                if (tc.id && !state.id) state.id = tc.id;
+                if (tc.function?.name && !state.name) state.name = tc.function.name;
+                if (tc.function?.arguments) state.argsJson += tc.function.arguments;
+              }
+            }
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => undefined);
+      }
+
+      if (toolStates.size === 0) {
+        return;
+      }
+
+      const calls = Array.from(toolStates.values());
+      currentMessages.push({
+        role: 'assistant',
+        content: turnAssistantText !== '' ? turnAssistantText : null,
+        tool_calls: calls.map((c) => ({
+          id: c.id,
+          type: 'function',
+          function: {
+            name: c.name,
+            arguments: c.argsJson,
+          },
+        })),
+      });
+
+      for (const call of calls) {
+        let args: Record<string, unknown> = {};
+        try {
+          const trimmed = call.argsJson.trim();
+          if (trimmed) args = JSON.parse(trimmed);
+        } catch {
+          args = {};
+        }
+
+        let toolResultText = '';
+        try {
+          const execRes = await this.deps.toolGateway.executeTool(toolCtx, call.name, args, signal);
+          toolResultText = execRes.text;
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          toolResultText = `[错误] ${errMsg}`;
+          this.deps.logger.warn(`[personal-ai] direct_llm 工具调用 ${call.name} 失败: ${errMsg}`);
+        }
+
+        currentMessages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          name: call.name,
+          content: toolResultText,
+        });
+      }
     }
   }
 
@@ -783,6 +975,7 @@ export class PersonalAIRuntime {
           input.usage,
           capture,
           input.publicOrigin,
+          identity,
         );
         return;
       }
@@ -858,6 +1051,7 @@ export class PersonalAIRuntime {
             input.usage,
             capture,
             input.publicOrigin,
+            identity,
           );
           return;
         }
@@ -978,6 +1172,7 @@ export class PersonalAIRuntime {
           input.usage,
           capture,
           input.publicOrigin,
+          identity,
         );
         return;
       }
@@ -1006,6 +1201,7 @@ export class PersonalAIRuntime {
           input.usage,
           capture,
           input.publicOrigin,
+          identity,
         );
         return;
       }

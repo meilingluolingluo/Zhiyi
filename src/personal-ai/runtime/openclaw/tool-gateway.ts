@@ -10,6 +10,7 @@ import type { AgentStore } from '../../../agents';
 import type { CandidateStore } from '../../../candidates';
 import type { Logger } from '../../../logger';
 import type { MemoryStore } from '../../../memories';
+import type { TrajectoryStore } from '../../../trajectories';
 import {
   evolveMemoryWrite,
   MemoryConflictError,
@@ -54,6 +55,7 @@ import type { BusinessTaskManager } from '../../task/business-task-manager';
 import type { TaskRepository } from '../../task/task-repository';
 import { buildProjectProgressSummary } from '../../proactive/project-summary';
 import type { ProactiveStore } from '../../proactive/proactive-store';
+import { MemoryService } from '../memory/memory-service';
 import type {
   ZhiyiPolicyDecision,
   ZhiyiToolContext,
@@ -63,6 +65,9 @@ import type {
 import { isOpenClawAgent } from './types';
 
 export const DEFAULT_SAFE_OPENCLAW_TOOLS: readonly string[] = [
+  'recall_memory',
+  'remember_memory',
+  'update_memory',
   'memory_search',
   'memory_get',
   'memory_create',
@@ -101,7 +106,7 @@ export class ToolPolicyDeniedError extends Error {
 }
 
 export function resolveAgentAllowedTools(ctx: Pick<ZhiyiToolContext, 'agent'>): ReadonlySet<string> {
-  const configured = ctx.agent.backend_config?.allowed_tools;
+  const configured = ctx.agent?.backend_config?.allowed_tools;
   if (Array.isArray(configured)) {
     return new Set(
       configured.filter((item): item is string => typeof item === 'string' && item.trim() !== ''),
@@ -113,6 +118,8 @@ export function resolveAgentAllowedTools(ctx: Pick<ZhiyiToolContext, 'agent'>): 
 export interface ZhiyiToolGatewayDeps {
   memoryStore: MemoryStore;
   candidateStore?: CandidateStore;
+  trajectoryStore?: TrajectoryStore;
+  memoryService?: MemoryService;
   businessTaskManager: BusinessTaskManager;
   goalStore: GoalStore;
   projectStore: ProjectStore;
@@ -141,8 +148,15 @@ export interface ZhiyiToolGatewayDeps {
 
 export class ZhiyiToolGateway {
   private readonly registry = new Map<string, ZhiyiToolDefinition>();
+  public readonly memoryService: MemoryService;
 
   constructor(private readonly deps: ZhiyiToolGatewayDeps) {
+    this.memoryService =
+      deps.memoryService ??
+      new MemoryService({
+        memoryStore: deps.memoryStore,
+        candidateStore: deps.candidateStore,
+      });
     this.registerBuiltinSafeTools();
     for (const tool of deps.extraTools ?? []) {
       this.registerTool(tool);
@@ -157,6 +171,7 @@ export class ZhiyiToolGateway {
       agentStore: this.deps.agentStore,
       candidateStore: this.deps.candidateStore,
       memoryStore: this.deps.memoryStore,
+      trajectoryStore: this.deps.trajectoryStore,
     };
   }
 
@@ -189,26 +204,39 @@ export class ZhiyiToolGateway {
       return { allowed: false, reason: '权限不足：缺少有效的服务端用户身份' };
     }
 
-    const liveAgent = this.deps.agentStore.get(ctx.agent.agent_id);
-    if (!liveAgent) {
-      return { allowed: false, reason: `权限不足：Agent ${ctx.agent.agent_id} 不存在` };
+    if (ctx.agent) {
+      const liveAgent = this.deps.agentStore.get(ctx.agent.agent_id);
+      if (!liveAgent) {
+        return { allowed: false, reason: `权限不足：Agent ${ctx.agent.agent_id} 不存在` };
+      }
+      if (liveAgent.status !== 'active') {
+        return { allowed: false, reason: `权限不足：Agent ${liveAgent.agent_id} 已禁用` };
+      }
+      if (!isOpenClawAgent(liveAgent)) {
+        return { allowed: false, reason: `权限不足：Agent ${liveAgent.agent_id} 未授权使用 OpenClaw` };
+      }
     }
-    if (liveAgent.status !== 'active') {
-      return { allowed: false, reason: `权限不足：Agent ${liveAgent.agent_id} 已禁用` };
-    }
-    if (!isOpenClawAgent(liveAgent)) {
-      return { allowed: false, reason: `权限不足：Agent ${liveAgent.agent_id} 未授权使用 OpenClaw` };
-    }
+
     if (!this.registry.has(toolName)) {
       return { allowed: false, reason: `工具拒绝：${toolName} 不在知忆安全工具白名单内` };
     }
 
-    const liveAllowedTools = resolveAgentAllowedTools({ agent: liveAgent });
-    if (!ctx.allowedTools.has(toolName) || !liveAllowedTools.has(toolName)) {
-      return {
-        allowed: false,
-        reason: `权限不足：Agent ${liveAgent.agent_id} 无权调用工具 ${toolName}`,
-      };
+    if (ctx.agent) {
+      const liveAgent = this.deps.agentStore.get(ctx.agent.agent_id)!;
+      const liveAllowedTools = resolveAgentAllowedTools({ agent: liveAgent });
+      if (!ctx.allowedTools.has(toolName) || !liveAllowedTools.has(toolName)) {
+        return {
+          allowed: false,
+          reason: `权限不足：Agent ${liveAgent.agent_id} 无权调用工具 ${toolName}`,
+        };
+      }
+    } else {
+      if (!ctx.allowedTools.has(toolName)) {
+        return {
+          allowed: false,
+          reason: `权限不足：未授权调用工具 ${toolName}`,
+        };
+      }
     }
 
     if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
@@ -236,7 +264,7 @@ export class ZhiyiToolGateway {
     const decision = this.checkPolicy(ctx, toolName, params);
     if (!decision.allowed) {
       this.deps.logger.warn(
-        `[openclaw-tool-gateway] 拒绝工具调用 user=${ctx.userId} agent=${ctx.agent.agent_id} tool=${toolName}: ${decision.reason}`,
+        `[openclaw-tool-gateway] 拒绝工具调用 user=${ctx.userId} agent=${ctx.agent?.agent_id ?? 'direct'} tool=${toolName}: ${decision.reason}`,
       );
       throw new ToolPolicyDeniedError(decision.reason ?? '权限不足');
     }
@@ -274,10 +302,195 @@ export class ZhiyiToolGateway {
     };
 
     const assertReadableMemoryScope = (ctx: ZhiyiToolContext, memory: Memory): void => {
-      if (memory.scope === 'agent' && memory.agent_id && memory.agent_id !== ctx.agent.agent_id) {
+      const activeAgentId = ctx.agent?.agent_id ?? ctx.identity?.agent_id;
+      if (memory.scope === 'agent' && memory.agent_id && memory.agent_id !== activeAgentId) {
         throw new ToolPolicyDeniedError('无权访问其他 Agent 专属记忆');
       }
     };
+
+    this.registerTool({
+      name: 'recall_memory',
+      label: '主动检索长期记忆',
+      description:
+        '当自动注入的记忆上下文不足，或者用户明确询问某条历史记忆、偏好、约定或架构决策时主动检索。日常问答优先依赖已自动注入的记忆，切忌每轮无意义重复调用。',
+      parameters: Type.Object(
+        {
+          query: Type.String({ minLength: 1, maxLength: 500, description: '检索关键词或具体问题' }),
+          scope: Type.Optional(
+            Type.String({
+              enum: [...MEMORY_SCOPES],
+              description: '可选限定作用域：personal（个人）| agent（Agent专属）| project（项目）',
+            }),
+          ),
+          limit: Type.Optional(
+            Type.Integer({ minimum: 1, maximum: 10, description: '返回条数上限（默认 5）' }),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      execute: async (ctx, params) => {
+        const query = String(params.query ?? '').trim();
+        const limit = typeof params.limit === 'number' ? Math.min(Math.max(1, params.limit), 10) : 5;
+        const scope = params.scope && MEMORY_SCOPES.includes(params.scope as MemoryScope)
+          ? (params.scope as MemoryScope)
+          : undefined;
+
+        const recallRes = this.memoryService.recall({
+          userId: ctx.userId,
+          query,
+          scope,
+          projectId: ctx.task?.project_id ?? ctx.identity?.project_id ?? undefined,
+          agentId: ctx.agent?.agent_id ?? ctx.identity?.agent_id ?? undefined,
+          limit,
+        });
+
+        if (recallRes.items.length === 0) {
+          return {
+            text: '未检索到匹配的长期记忆。',
+            details: { count: 0, items: [] },
+          };
+        }
+
+        const summary = recallRes.items
+          .map((item, idx) => {
+            const trust = item.trust_label;
+            const link = [
+              item.project_id ? `project=${item.project_id}` : '',
+              item.goal_id ? `goal=${item.goal_id}` : '',
+              item.task_id ? `task=${item.task_id}` : '',
+            ]
+              .filter(Boolean)
+              .join(',');
+            return `${idx + 1}. (${item.memory_id}) [${item.scope}/${item.category}/${item.type}，${trust}，置信度 ${item.confidence.toFixed(2)}${link ? `，${link}` : ''}] ${item.content}`;
+          })
+          .join('\n');
+
+        return {
+          text: summary,
+          details: { count: recallRes.count, items: recallRes.items },
+        };
+      },
+    });
+
+    this.registerTool({
+      name: 'remember_memory',
+      label: '保存用户明确要求长期记住的信息',
+      description:
+        '仅当用户明确要求记住（例如“记住……”、“保存偏好……”、“确认这个决策……”）时才允许调用。严禁凭模型推测擅自保存闲聊或临时信息。',
+      parameters: Type.Object(
+        {
+          content: Type.String({ minLength: 4, maxLength: 2000, description: '用户明确要求记住的偏好、习惯或稳定事实' }),
+          scope: Type.Optional(
+            Type.String({
+              enum: [...MEMORY_SCOPES],
+              description: '记忆作用域：personal（默认）| agent | project',
+            }),
+          ),
+          category: Type.Optional(
+            Type.String({
+              enum: [...MEMORY_CATEGORIES],
+              description: '记忆分类：preference（偏好）| profile_fact | goal | project_fact | experience | event | general',
+            }),
+          ),
+          type: Type.Optional(
+            Type.String({
+              enum: [...MEMORY_TYPES],
+              description: '记忆类型：semantic（默认）| identity | episodic | procedural | working',
+            }),
+          ),
+          project_id: Type.Optional(Type.String({ minLength: 1, maxLength: 100, description: '所属项目 ID（仅在 scope 为 project 时有效）' })),
+          confidence: Type.Optional(Type.Number({ minimum: 0.1, maximum: 1.0, description: '置信度，默认 1.0' })),
+          expires_at: Type.Optional(Type.String({ minLength: 4, maxLength: 64, description: '过期时间' })),
+        },
+        { additionalProperties: false },
+      ),
+      execute: async (ctx, params) => {
+        const content = String(params.content ?? '').trim();
+        const scope = params.scope && MEMORY_SCOPES.includes(params.scope as MemoryScope)
+          ? (params.scope as MemoryScope)
+          : 'personal';
+        const category = params.category && MEMORY_CATEGORIES.includes(params.category as MemoryCategory)
+          ? (params.category as MemoryCategory)
+          : 'preference';
+        const type = params.type && MEMORY_TYPES.includes(params.type as MemoryType)
+          ? (params.type as MemoryType)
+          : 'semantic';
+
+        const projectId =
+          typeof params.project_id === 'string' && params.project_id.trim() !== ''
+            ? params.project_id.trim()
+            : scope === 'project'
+              ? (ctx.task?.project_id ?? ctx.identity?.project_id ?? null)
+              : null;
+
+        assertOwnedMemoryRefs(ctx, { projectId, goalId: null, taskId: null });
+
+        const confidence = typeof params.confidence === 'number' ? params.confidence : 1.0;
+        const expiresAt = typeof params.expires_at === 'string' && params.expires_at.trim() !== ''
+          ? params.expires_at.trim()
+          : null;
+
+        const result = this.memoryService.remember({
+          userId: ctx.userId,
+          content,
+          scope,
+          category,
+          type,
+          projectId,
+          agentId: scope === 'agent' ? (ctx.agent?.agent_id ?? ctx.identity?.agent_id ?? null) : null,
+          confidence,
+          expiresAt,
+        });
+
+        return {
+          text: `已成功保存用户长期记忆 ${result.memory.memory_id} [${result.memory.scope}/${result.memory.category}]：${result.memory.content}`,
+          details: { memory_id: result.memory.memory_id, action: result.action, memory: result.memory },
+        };
+      },
+    });
+
+    this.registerTool({
+      name: 'update_memory',
+      label: '修改或纠正已有记忆',
+      description:
+        '仅当用户明确要求修改某条已有记忆（例如“将之前记录的架构记忆改为 PostgreSQL + Redis”）且已确定目标 memory_id 时才允许调用。若目标记忆不明确，应先询问用户或调用 recall_memory 查找，严禁凭猜测修改相似记忆。',
+      parameters: Type.Object(
+        {
+          memory_id: Type.String({ minLength: 1, maxLength: 100, description: '目标记忆 ID（必填，不可凭空猜测）' }),
+          content: Type.Optional(Type.String({ minLength: 4, maxLength: 2000, description: '更新后的记忆内容' })),
+          category: Type.Optional(Type.String({ enum: [...MEMORY_CATEGORIES] })),
+          scope: Type.Optional(Type.String({ enum: [...MEMORY_SCOPES] })),
+          type: Type.Optional(Type.String({ enum: [...MEMORY_TYPES] })),
+          confidence: Type.Optional(Type.Number({ minimum: 0.1, maximum: 1.0 })),
+          expires_at: Type.Optional(Type.Union([Type.String({ minLength: 4, maxLength: 64 }), Type.Null()])),
+        },
+        { additionalProperties: false },
+      ),
+      execute: async (ctx, params) => {
+        const memoryId = String(params.memory_id ?? '').trim();
+        const existing = this.deps.memoryStore.getById(ctx.userId, memoryId);
+        if (!existing) {
+          throw new DomainError(404, 'memory_not_found', `记忆 ${memoryId} 不存在或无权访问`);
+        }
+        assertReadableMemoryScope(ctx, existing);
+
+        const updated = this.memoryService.update({
+          userId: ctx.userId,
+          memoryId,
+          content: typeof params.content === 'string' ? params.content.trim() : undefined,
+          category: params.category as MemoryCategory | undefined,
+          scope: params.scope as MemoryScope | undefined,
+          type: params.type as MemoryType | undefined,
+          confidence: typeof params.confidence === 'number' ? params.confidence : undefined,
+          expiresAt: params.expires_at as string | null | undefined,
+        });
+
+        return {
+          text: `已成功更新记忆 ${updated.memory_id}：${updated.content}`,
+          details: { memory: updated },
+        };
+      },
+    });
 
     this.registerTool({
       name: 'memory_search',
@@ -307,11 +520,11 @@ export class ZhiyiToolGateway {
         const hits = searchMemories(this.deps.memoryStore, {
           query,
           user_id: ctx.userId,
-          agent_id: ctx.agent.agent_id,
+          agent_id: ctx.agent?.agent_id ?? ctx.identity?.agent_id ?? undefined,
           project_id:
             typeof params.project_id === 'string' && params.project_id.trim() !== ''
               ? params.project_id.trim()
-              : ctx.task.project_id ?? undefined,
+              : (ctx.task?.project_id ?? ctx.identity?.project_id ?? undefined),
           goal_id: typeof params.goal_id === 'string' ? params.goal_id.trim() : undefined,
           task_id: typeof params.task_id === 'string' ? params.task_id.trim() : undefined,
           categories: categories.length > 0 ? categories : undefined,
@@ -403,7 +616,7 @@ export class ZhiyiToolGateway {
           typeof params.project_id === 'string' && params.project_id.trim() !== ''
             ? params.project_id.trim()
             : scope === 'project'
-              ? ctx.task.project_id
+              ? (ctx.task?.project_id ?? ctx.identity?.project_id ?? null)
               : null;
         const goalId =
           typeof params.goal_id === 'string' && params.goal_id.trim() !== ''
@@ -426,7 +639,7 @@ export class ZhiyiToolGateway {
           this.deps.memoryStore,
           {
             user_id: ctx.userId,
-            agent_id: scope === 'agent' ? ctx.agent.agent_id : null,
+            agent_id: scope === 'agent' ? (ctx.agent?.agent_id ?? ctx.identity?.agent_id ?? null) : null,
             project_id: projectId,
             goal_id: goalId,
             task_id: taskId,
@@ -434,7 +647,7 @@ export class ZhiyiToolGateway {
             scope,
             category,
             content,
-            source: `agent:${ctx.agent.agent_id}`,
+            source: ctx.agent ? `agent:${ctx.agent.agent_id}` : 'direct_llm',
             confidence,
             expires_at: expiresAt,
           },
@@ -446,7 +659,7 @@ export class ZhiyiToolGateway {
             this.deps.candidateStore.create(
               {
                 user_id: ctx.userId,
-                agent_id: ctx.agent.agent_id,
+                agent_id: ctx.agent?.agent_id ?? ctx.identity?.agent_id ?? undefined,
                 project_id: projectId,
                 goal_id: goalId,
                 task_id: taskId,
@@ -454,7 +667,7 @@ export class ZhiyiToolGateway {
                 scope,
                 category,
                 content,
-                source: `agent:${ctx.agent.agent_id}:conflict`,
+                source: ctx.agent ? `agent:${ctx.agent.agent_id}:conflict` : 'direct_llm:conflict',
                 confidence,
                 status: 'pending',
               },

@@ -5,16 +5,17 @@
  */
 import type { AgentStore } from '../../agents';
 import type { AppConfig } from '../../config';
-import { buildMemoryContext, injectMemoryMessages } from '../../context';
-import type { ResolvedIdentity } from '../../identity';
+import { injectMemoryMessages } from '../../context';
 import type { Logger } from '../../logger';
 import type { MemoryStore } from '../../memories';
 import type { AgentProfile, ChatMessage } from '../../types';
 import { ModelAdapterError, type ModelAdapter, type TokenUsage } from '../adapters/model/model-adapter';
+import type { ProjectStore } from '../domain/project-store';
 import type { BusinessTask } from '../domain/types';
 import type { PersonalAIIdentity } from '../identity/identity-manager';
 import type { BusinessTaskManager } from '../task/business-task-manager';
 import type { ExecutionTask } from '../task/task-repository';
+import { MemoryContextProvider, MemoryService } from './memory';
 
 const MAX_RESULT_CHARS = 100_000;
 
@@ -25,6 +26,8 @@ export interface DirectExecutionRunnerDeps {
   modelAdapter: ModelAdapter;
   businessTaskManager: BusinessTaskManager;
   logger: Logger;
+  memoryContextProvider?: MemoryContextProvider;
+  projectStore?: ProjectStore;
 }
 
 export class DirectExecutionRunner {
@@ -55,20 +58,29 @@ export class DirectExecutionRunner {
     }
     baseMessages.push({ role: 'user', content: promptText });
 
-    const memory = buildMemoryContext({
-      config: this.deps.config,
-      memoryStore: this.deps.memoryStore,
-      agentStore: this.deps.agentStore,
+    const memoryProvider =
+      this.deps.memoryContextProvider ??
+      new MemoryContextProvider({
+        config: this.deps.config,
+        memoryService: new MemoryService({ memoryStore: this.deps.memoryStore }),
+        agentStore: this.deps.agentStore,
+        projectStore: this.deps.projectStore,
+        logger: this.deps.logger,
+      });
+
+    const memory = memoryProvider.buildContext({
       identity: {
         ...identity,
         agent_id: agent.agent_id,
         project_id: task.project_id ?? identity.project_id,
-      } as unknown as ResolvedIdentity,
-      messages: baseMessages,
+      },
+      queryText: promptText,
+      projectId: task.project_id ?? identity.project_id,
+      agentId: agent.agent_id,
     });
     const messages: ChatMessage[] =
-      memory.injected && memory.systemMessage
-        ? injectMemoryMessages(baseMessages, memory.systemMessage)
+      memory.injected && memory.text
+        ? injectMemoryMessages(baseMessages, memory.text)
         : baseMessages;
 
     const signal: AbortSignal = options.signal

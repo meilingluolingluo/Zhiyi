@@ -16,6 +16,7 @@ import type { AppConfig } from '../config';
 import type { Database } from '../db';
 import { errorBody } from '../errors';
 import type { MemoryStore } from '../memories';
+import type { TrajectoryStore } from '../trajectories';
 import { updateProjectForUser } from './domain/work-operations';
 import type { AgentExecutionAdapter } from './adapters/agent/agent-adapter';
 import type { PersonalAIConfig } from './config';
@@ -67,6 +68,7 @@ export interface DomainRouterDeps {
   agentStore?: AgentStore;
   memoryStore?: MemoryStore;
   candidateStore?: CandidateStore;
+  trajectoryStore?: TrajectoryStore;
   userProfiles: UserProfileStore;
   goalStore: GoalStore;
   projectStore: ProjectStore;
@@ -403,6 +405,7 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
           businessTaskManager: deps.businessTaskManager,
           candidateStore: deps.candidateStore,
           memoryStore: deps.memoryStore,
+          trajectoryStore: deps.trajectoryStore,
         },
         identity.user_id,
         req.params.id,

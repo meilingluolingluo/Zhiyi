@@ -3,11 +3,13 @@
  * 提取结果只写候选表，低置信度不自动进入正式记忆，必须人工 approve。
  */
 import type { AppConfig } from './config';
+import { messageText } from './context';
 import { ruleBasedExtract } from './extraction-rules';
 import type { MockUpstream } from './mock-upstream';
 import type { Logger } from './logger';
 import type { CandidateStore } from './candidates';
 import type { MemoryStore } from './memories';
+import { searchMemories } from './search';
 import {
   buildUpstreamRequestForRoute,
   resolveOneApiRoute,
@@ -17,19 +19,46 @@ import type { UpstreamService } from './upstream/service';
 import type {
   ChatMessage,
   ExtractedCandidate,
+  Memory,
   Trajectory,
   UpstreamTransport,
 } from './types';
 
-const EXTRACT_SYSTEM_PROMPT = [
-  '你是记忆抽取器。请从对话中识别具有长期价值的信息：用户偏好、稳定个人属性、常用技术/工具、长期目标、项目关键决策、已验证工作经验。',
-  '规则：',
-  '1. 普通闲聊、一次性临时安排（如“今天先这样/临时试一下”）或纯提问不要保存。',
-  '2. 无法确定或模型自身猜测的内容不要冒充用户事实。',
-  '3. 重复内容合并，只输出有明确依据的条目。',
-  '只返回 JSON 对象，格式为 {"memories":[{"type":"semantic","scope":"personal","category":"preference","content":"原文摘录","confidence":0.8,"reason":"原因"}]}。',
-  'type 取值 identity|episodic|semantic|procedural|working；scope 取值 personal|agent|project|organization；category 取值 profile_fact|preference|goal|project_fact|experience|event。',
-].join('\n');
+/** 构建融合已有记忆索引与演化事件的提取提示词（Mem0 V3 架构）。 */
+function buildExtractSystemPrompt(existingListPrompt: string[]): string {
+  return [
+    '你是专业的长期记忆提取与演化分析器（Memory Extractor & Evolution Analyzer）。',
+    '请从对话中识别具有长期价值的信息：用户偏好、稳定个人属性、常用技术/工具、长期目标、项目关键决策、已验证工作经验。',
+    '',
+    '【已有记忆清单（引用时必须使用方括号内的数字索引，严禁编造任何 UUID 或假 ID）】：',
+    existingListPrompt.length > 0 ? existingListPrompt.join('\n') : '(当前暂无相关已有记忆)',
+    '',
+    '【提取与演化规则】：',
+    '1. 普通闲聊、一次性临时安排（如“今天先这样/临时试一下”）或纯提问不要保存。',
+    '2. 区分事件类型 event：',
+    '   - "ADD": 全新事实，已有记忆列表中无相关条目（old_memory_index 设为 null）；',
+    '   - "UPDATE": 与已有记忆冲突或更新变更（old_memory_index 设为对应记忆的数字索引）；',
+    '   - "SUPPLEMENT": 对已有记忆的补充或扩展细节（old_memory_index 设为对应记忆的数字索引）；',
+    '   - "DELETE": 已有记忆中的方案/约定已被用户明确声明废弃或下线（old_memory_index 设为对应记忆的数字索引）；',
+    '   - "NONE": 无长期保存价值。',
+    '3. 提取实体 entities 列表（如技术栈名称、库名、工具、模块名等）。',
+    '4. 输出格式必须为严格合法的 JSON 对象：',
+    '{"memories": [',
+    '  {',
+    '    "event": "ADD" | "UPDATE" | "SUPPLEMENT" | "DELETE",',
+    '    "old_memory_index": number | null,',
+    '    "type": "semantic" | "episodic" | "procedural" | "identity",',
+    '    "scope": "personal" | "project" | "agent",',
+    '    "category": "preference" | "profile_fact" | "goal" | "project_fact" | "experience",',
+    '    "content": "精确、客观的事实表述",',
+    '    "confidence": 0.85,',
+    '    "entities": ["entity1", "entity2"],',
+    '    "reason": "判断依据与原因"',
+    '  }',
+    ']}',
+    '如果没有需要记录的长期记忆，请输出 {"memories": []}。',
+  ].join('\n');
+}
 
 export interface ExtractionJob {
   trajectory: Trajectory;
@@ -72,7 +101,13 @@ function parseExtractionJson(content: string): { memories?: unknown } {
   }
 }
 
-function sanitize(items: unknown): ExtractedCandidate[] {
+/**
+ * 校验清洗模型或规则输出，将 old_memory_index 映射为真实的已有 memory_id（防 ID 幻觉）。
+ */
+function sanitizeWithIndexMap(
+  items: unknown,
+  indexMap: Map<number, Memory>,
+): ExtractedCandidate[] {
   if (!Array.isArray(items)) return [];
   const result: ExtractedCandidate[] = [];
   for (const raw of items) {
@@ -81,6 +116,38 @@ function sanitize(items: unknown): ExtractedCandidate[] {
     if (typeof item.content !== 'string' || item.content.trim().length < 6) continue;
     const confidence: number = Number(item.confidence);
     if (!Number.isFinite(confidence)) continue;
+
+    let oldMemoryId: string | null = null;
+    if (typeof item.old_memory_id === 'string' && item.old_memory_id.trim()) {
+      oldMemoryId = item.old_memory_id.trim();
+    } else {
+      const rawIdx =
+        typeof item.old_memory_index === 'number'
+          ? item.old_memory_index
+          : typeof item.old_memory_index === 'string' && /^\d+$/.test(item.old_memory_index)
+            ? Number(item.old_memory_index)
+            : null;
+      if (rawIdx !== null && indexMap.has(rawIdx)) {
+        oldMemoryId = indexMap.get(rawIdx)!.memory_id;
+      }
+    }
+
+    let event: ExtractedCandidate['event'] = 'ADD';
+    if (
+      item.event === 'UPDATE' ||
+      item.event === 'SUPPLEMENT' ||
+      item.event === 'DELETE' ||
+      item.event === 'NONE'
+    ) {
+      event = item.event;
+    }
+
+    const entities: string[] = Array.isArray(item.entities)
+      ? item.entities
+          .filter((e): e is string => typeof e === 'string' && e.trim().length > 0)
+          .map((e) => e.trim())
+      : [];
+
     result.push({
       type: (typeof item.type === 'string' ? item.type : 'semantic') as ExtractedCandidate['type'],
       scope: (typeof item.scope === 'string' ? item.scope : 'personal') as ExtractedCandidate['scope'],
@@ -88,6 +155,9 @@ function sanitize(items: unknown): ExtractedCandidate[] {
       content: item.content.trim(),
       confidence: Math.min(1, Math.max(0, confidence)),
       reason: typeof item.reason === 'string' ? item.reason : 'model-extract',
+      event,
+      old_memory_id: oldMemoryId,
+      entities,
     });
   }
   return result.slice(0, 5);
@@ -140,12 +210,34 @@ export class ExtractionQueue {
   }
 
   private async extractWithModel(job: ExtractionJob): Promise<ExtractedCandidate[]> {
+    const userText = job.messages
+      .filter((m) => m.role === 'user')
+      .map(messageText)
+      .join(' ');
+    const queryText = (userText + ' ' + (job.assistantText || '')).trim().slice(0, 500);
+
+    const existingHits = searchMemories(this.deps.memoryStore, {
+      user_id: job.trajectory.user_id,
+      query: queryText || '偏好 规则 技术栈',
+      limit: 8,
+    });
+    const existingMemories = existingHits.map((h) => h.memory);
+    const indexMap = new Map<number, Memory>();
+    const existingListPrompt: string[] = [];
+    existingMemories.forEach((m, idx) => {
+      indexMap.set(idx, m);
+      existingListPrompt.push(
+        `[${idx}] (类型:${m.type}, 作用域:${m.scope}, 分类:${m.category}) ${m.content}`,
+      );
+    });
+
     if (this.deps.config.mockUpstream && this.deps.mock) {
       try {
-        return sanitize(await this.deps.mock.extract(job.messages, job.assistantText));
+        const mockResult = await this.deps.mock.extract(job.messages, job.assistantText);
+        return sanitizeWithIndexMap(mockResult, indexMap);
       } catch (error) {
         this.deps.logger.warn('Mock 提取模型不可用，回退规则提取', error);
-        return sanitize(ruleBasedExtract(job.messages, job.assistantText));
+        return sanitizeWithIndexMap(ruleBasedExtract(job.messages, job.assistantText), indexMap);
       }
     }
 
@@ -156,7 +248,7 @@ export class ExtractionQueue {
       stream: false,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: EXTRACT_SYSTEM_PROMPT },
+        { role: 'system', content: buildExtractSystemPrompt(existingListPrompt) },
         {
           role: 'user',
           content: JSON.stringify({
@@ -203,15 +295,18 @@ export class ExtractionQueue {
       const envelope = (await response.json()) as ModelEnvelope;
       const content: string = envelope.choices?.[0]?.message?.content ?? '{}';
       const parsed = parseExtractionJson(content);
-      const extracted: ExtractedCandidate[] = sanitize(parsed.memories);
+      if (Array.isArray(parsed.memories) && parsed.memories.length === 0) {
+        return [];
+      }
+      const extracted: ExtractedCandidate[] = sanitizeWithIndexMap(parsed.memories, indexMap);
       if (extracted.length === 0) {
         this.deps.logger.info('模型提取未产出可用候选，回退规则提取');
-        return sanitize(ruleBasedExtract(job.messages, job.assistantText));
+        return sanitizeWithIndexMap(ruleBasedExtract(job.messages, job.assistantText), indexMap);
       }
       return extracted;
     } catch (error) {
       this.deps.logger.warn('提取模型调用失败，回退规则提取', error);
-      return sanitize(ruleBasedExtract(job.messages, job.assistantText));
+      return sanitizeWithIndexMap(ruleBasedExtract(job.messages, job.assistantText), indexMap);
     }
   }
 

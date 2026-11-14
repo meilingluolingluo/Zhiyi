@@ -4,6 +4,8 @@
  */
 import type { AgentStore } from '../../agents';
 import type { Logger } from '../../logger';
+import type { MemoryStore } from '../../memories';
+import { searchMemories } from '../../search';
 import type { AgentProfile } from '../../types';
 import type { ModelAdapter } from '../adapters/model/model-adapter';
 import type { GoalStore } from '../domain/goal-store';
@@ -51,6 +53,7 @@ export interface ButlerExecutionResult {
 
 export interface ButlerCoordinatorDeps {
   agentStore: AgentStore;
+  memoryStore?: MemoryStore;
   agentSelector: AgentSelector;
   businessTaskManager: BusinessTaskManager;
   taskRepo: TaskRepository;
@@ -84,10 +87,30 @@ export class ButlerCoordinator {
       (a: AgentProfile) => `${a.agent_id} (${a.name}: ${a.description}; 后端=${a.execution_backend})`,
     );
 
-    const prompt = [
+    let memoryConstraintPrompt = '';
+    if (this.deps.memoryStore) {
+      const memoryHits = searchMemories(this.deps.memoryStore, {
+        user_id: userId,
+        query: goalText,
+        limit: 5,
+      });
+      if (memoryHits.length > 0) {
+        const memLines = memoryHits.map(
+          (h) => `- [${h.memory.scope}/${h.memory.category}] ${h.memory.content}`,
+        );
+        memoryConstraintPrompt = `用户相关长期记忆约束（规划子任务时必须遵守）：\n${memLines.join('\n')}`;
+      }
+    }
+
+    const promptParts = [
       '你是指忆（Zhiyi）个人 AI 的总管家（Butler / Router）。用户提出了一个复杂目标，你需要进行结构化规划与拆解。',
       '请根据目标拆解为 2-4 个有先后执行依赖的清晰子任务。',
       `可用 Worker Agent 清单：\n${agentSummaries.join('\n')}`,
+    ];
+    if (memoryConstraintPrompt) {
+      promptParts.push(memoryConstraintPrompt);
+    }
+    promptParts.push(
       '请直接输出严格的 JSON 对象，不要添加任何额外的 Markdown 代码块或问候语。',
       'JSON Schema 格式：',
       '{',
@@ -105,7 +128,8 @@ export class ButlerCoordinator {
       '  "rationale": string',
       '}',
       `用户目标：${goalText.slice(0, 3000)}`,
-    ].join('\n\n');
+    );
+    const prompt = promptParts.join('\n\n');
 
     let parsedPlan: ButlerDecompositionPlan | null = null;
     try {

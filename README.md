@@ -140,9 +140,12 @@ DEFAULT_MODEL=your-model-name
 | GET | `/v1/memory-candidates` | 候选列表（可按 status 过滤） |
 | POST | `/v1/memory-candidates/:id/approve` | 确认入库（幂等） |
 | POST | `/v1/memory-candidates/:id/reject` | 拒绝候选 |
-| GET | `/v1/memory-desk/memories` | **记忆台**：正式记忆列表（支持 type/scope/category/status 过滤与分页） |
+| GET | `/v1/memory-desk/memories` | **记忆台**：正式记忆列表（支持 type/scope/category/status/source 过滤与统一分页） |
+| GET | `/v1/memory-desk/memories/:id` | **记忆台**：单条正式记忆详情（含证据轨迹摘要与证据状态判定，跨用户 404） |
 | POST | `/v1/memory-desk/memories` | **记忆台**：手动创建正式记忆（`source='manual'`，可挂载证据轨迹） |
-| GET | `/v1/memory-desk/candidates` | **记忆台**：候选记忆列表（默认 `pending`，支持 status 过滤与分页） |
+| PATCH | `/v1/memory-desk/memories/:id` | **记忆台**：编辑正式记忆（受控修改 content/type/scope/category/status 等字段，更新检索索引） |
+| DELETE | `/v1/memory-desk/memories/:id` | **记忆台**：删除正式记忆（从检索索引中移除，保留底层轨迹证据，重复删除 404） |
+| GET | `/v1/memory-desk/candidates` | **记忆台**：候选记忆列表（默认 `pending`，支持 status 过滤与统一分页） |
 | GET | `/v1/memory-desk/candidates/:id` | **记忆台**：候选详情（含 `evidence_trajectory_ids` 与人机对话证据摘要） |
 | POST | `/v1/memory-desk/candidates/:id/approve` | **记忆台**：审批候选入库（幂等；强校验有效证据轨迹，无有效证据拒绝 400） |
 | POST | `/v1/memory-desk/candidates/:id/reject` | **记忆台**：拒绝候选记忆（幂等；已通过的候选禁止拒绝 409） |
@@ -306,13 +309,19 @@ curl -s -X POST http://127.0.0.1:8787/v1/chat/completions \
 
 ### 5.10 记忆台（Memory Desk）治理链路
 
-记忆台统一通过 `/v1/memory-desk` 前缀提供轻量管理接口，身份严格通过 API Key 解析，越权一律 404。
+记忆台统一通过 `/v1/memory-desk` 前缀提供轻量管理接口，身份严格通过 API Key 解析，越权一律返回 404。
 
-#### 1. 查看待审批候选记忆列表（默认 pending，支持分页）
+#### 分页与通用查询规则
+
+- `limit`：默认 `20`，单页上限 `100`（传入大于 100 自动截断为 100，小于等于 0 或非整数返回 400）。
+- `offset`：默认 `0`，小于 0 或非整数返回 400。
+- 排序：按更新时间与 ID 稳定降序排序（`updated_at DESC, memory_id DESC`）。
+
+#### 1. 查看待审批候选记忆列表（默认 pending，支持分页与状态过滤）
 
 ```bash
 curl -s -H "Authorization: Bearer dev-key-developer" \
-  "http://127.0.0.1:8787/v1/memory-desk/candidates?limit=10&offset=0"
+  "http://127.0.0.1:8787/v1/memory-desk/candidates?status=pending&limit=20&offset=0"
 ```
 
 响应示例：
@@ -328,18 +337,20 @@ curl -s -H "Authorization: Bearer dev-key-developer" \
       "content": "包管理工具统一使用 pnpm",
       "confidence": 0.95,
       "status": "pending",
-      "evidence_trajectory_ids": ["req_20261114_trace1"]
+      "evidence_trajectory_ids": ["req_20261114_trace1"],
+      "created_at": "2026-11-14T10:00:00.000Z",
+      "updated_at": "2026-11-14T10:00:00.000Z"
     }
   ],
   "total": 1,
-  "limit": 10,
+  "limit": 20,
   "offset": 0
 }
 ```
 
-#### 2. 查看候选详情与证据轨迹摘要
+#### 2. 查看候选详情与证据轨迹摘要（含进化演进分析）
 
-审查候选记忆时可直接获取人机交互摘要（用户提问与模型答复截取）：
+审查候选记忆时获取对应的人机交互上下文摘要（用户提问与模型答复截取）以及与当前正式记忆库的演化分析（全新/重复/补充/冲突）：
 
 ```bash
 curl -s -H "Authorization: Bearer dev-key-developer" \
@@ -352,8 +363,25 @@ curl -s -H "Authorization: Bearer dev-key-developer" \
   "candidate": {
     "id": "cand_a1b2c3d4",
     "content": "包管理工具统一使用 pnpm",
-    "status": "pending"
+    "status": "pending",
+    "type": "semantic",
+    "scope": "personal",
+    "category": "preference",
+    "confidence": 0.95
   },
+  "evolution_analysis": {
+    "relation": "conflict",
+    "relatedMemory": {
+      "memory_id": "mem_old123"
+    },
+    "suggestion": "与已有记忆(mem_old123)存在偏好或决策冲突",
+    "action": "supersede"
+  },
+  "conflict_memory": {
+    "memory_id": "mem_old123",
+    "content": "包管理工具统一使用 npm"
+  },
+  "evidence_status": "available",
   "evidence_trajectory_ids": ["req_20261114_trace1"],
   "evidence_trajectories": [
     {
@@ -369,10 +397,30 @@ curl -s -H "Authorization: Bearer dev-key-developer" \
 }
 ```
 
-#### 3. 审批通过候选入库（幂等；无证据或证据无效返回 400）
+#### 2.1 编辑待审候选记忆（PATCH）
+
+在审批入库前调整候选记忆的提炼内容、分类或置信度，严格锁定底层证据链防篡改：
+
+```bash
+curl -s -X PATCH -H "Authorization: Bearer dev-key-developer" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "前端工程包管理工具统一使用 pnpm",
+    "confidence": 0.98
+  }' \
+  "http://127.0.0.1:8787/v1/memory-desk/candidates/cand_a1b2c3d4"
+```
+
+#### 3. 审批通过候选入库（支持 overrides 改写审批与版本替代，幂等）
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "overrides": {
+      "content": "前端工程包管理工具统一使用 pnpm（团队强制规范）"
+    }
+  }' \
   "http://127.0.0.1:8787/v1/memory-desk/candidates/cand_a1b2c3d4/approve"
 ```
 
@@ -386,10 +434,16 @@ curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
     "user_id": "u1",
     "type": "semantic",
     "scope": "personal",
-    "content": "包管理工具统一使用 pnpm",
+    "category": "preference",
+    "content": "前端工程包管理工具统一使用 pnpm（团队强制规范）",
     "source": "candidate:cand_a1b2c3d4",
+    "status": "active",
     "verified_by_user": true,
-    "evidence_trajectory_ids": ["req_20261114_trace1"]
+    "confidence": 0.98,
+    "evidence_trajectory_ids": ["req_20261114_trace1"],
+    "superseded_by": null,
+    "created_at": "2026-11-14T10:05:00.000Z",
+    "updated_at": "2026-11-14T10:05:00.000Z"
   },
   "candidate": {
     "id": "cand_a1b2c3d4",
@@ -399,21 +453,149 @@ curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
 }
 ```
 
-#### 4. 在正式记忆库中查询已审核记忆
-
-```bash
-curl -s -H "Authorization: Bearer dev-key-developer" \
-  "http://127.0.0.1:8787/v1/memory-desk/memories?scope=personal&type=semantic"
-```
-
-#### 5. 拒绝候选记忆（幂等）
+#### 4. 拒绝候选记忆（幂等；已通过的候选禁止拒绝返回 409）
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
   "http://127.0.0.1:8787/v1/memory-desk/candidates/cand_a1b2c3d4/reject"
 ```
 
-#### 6. 手动录入正式记忆（标记 source=manual，支持挂载证据轨迹）
+#### 5. 正式记忆列表查询（支持 source/type/scope/category/status 过滤与分页）
+
+```bash
+curl -s -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/memories?scope=personal&type=semantic&source=candidate&limit=20&offset=0"
+```
+
+响应示例：
+```json
+{
+  "items": [
+    {
+      "memory_id": "mem_e5f6g7h8",
+      "user_id": "u1",
+      "type": "semantic",
+      "scope": "personal",
+      "category": "preference",
+      "content": "包管理工具统一使用 pnpm",
+      "source": "candidate:cand_a1b2c3d4",
+      "status": "active",
+      "verified_by_user": true,
+      "confidence": 0.95,
+      "evidence_trajectory_ids": ["req_20261114_trace1"],
+      "created_at": "2026-11-14T10:05:00.000Z",
+      "updated_at": "2026-11-14T10:05:00.000Z"
+    }
+  ],
+  "total": 1,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+#### 6. 正式记忆单条详情（含证据轨迹摘要与证据有效性判定）
+
+证据状态判定规则：
+- `available`：引用的所有轨迹记录均存在且可读取。
+- `partial`：部分引用轨迹存在，部分丢失。
+- `missing`：记录了轨迹 ID，但底层数据库中均已不存在。
+- `manual_no_evidence`：用户手动录入的记忆（无历史对话证据是正常状态，不视作异常）。
+- `none`：无证据轨迹记录。
+
+```bash
+curl -s -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/memories/mem_e5f6g7h8"
+```
+
+响应示例：
+```json
+{
+  "memory": {
+    "memory_id": "mem_e5f6g7h8",
+    "user_id": "u1",
+    "type": "semantic",
+    "scope": "personal",
+    "category": "preference",
+    "content": "包管理工具统一使用 pnpm",
+    "source": "candidate:cand_a1b2c3d4",
+    "status": "active",
+    "verified_by_user": true,
+    "confidence": 0.95,
+    "evidence_trajectory_ids": ["req_20261114_trace1"],
+    "created_at": "2026-11-14T10:05:00.000Z",
+    "updated_at": "2026-11-14T10:05:00.000Z"
+  },
+  "previous_versions": [],
+  "evidence_status": "available",
+  "evidence_trajectory_ids": ["req_20261114_trace1"],
+  "evidence_trajectories": [
+    {
+      "id": "traj_001",
+      "request_id": "req_20261114_trace1",
+      "agent_id": "developer",
+      "model": "deepseek-chat",
+      "user_prompt": "以后所有项目统一用 pnpm 管理依赖",
+      "assistant_response": "已记录该规范，后续依赖管理优先使用 pnpm。",
+      "created_at": "2026-11-14T10:00:00.000Z"
+    }
+  ]
+}
+```
+
+#### 7. 编辑正式记忆（PATCH）
+
+支持修改 `content`、`type`、`scope`、`category`、`status`、`confidence`、`expires_at`。严禁修改 `memory_id`、`user_id`、`source`、`created_at` 等身份与来源字段（传入非法字段返回 400）。修改后自动更新检索结果与 `updated_at`。
+
+```bash
+curl -s -X PATCH -H "Authorization: Bearer dev-key-developer" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "全仓库包管理工具统一使用 pnpm，严禁使用 npm/yarn",
+    "confidence": 0.98
+  }' \
+  "http://127.0.0.1:8787/v1/memory-desk/memories/mem_e5f6g7h8"
+```
+
+响应示例：
+```json
+{
+  "ok": true,
+  "memory": {
+    "memory_id": "mem_e5f6g7h8",
+    "user_id": "u1",
+    "type": "semantic",
+    "scope": "personal",
+    "category": "preference",
+    "content": "全仓库包管理工具统一使用 pnpm，严禁使用 npm/yarn",
+    "source": "candidate:cand_a1b2c3d4",
+    "status": "active",
+    "verified_by_user": true,
+    "confidence": 0.98,
+    "evidence_trajectory_ids": ["req_20261114_trace1"],
+    "created_at": "2026-11-14T10:05:00.000Z",
+    "updated_at": "2026-11-14T10:10:00.000Z"
+  }
+}
+```
+
+#### 8. 删除正式记忆（DELETE）
+
+删除操作将该记忆从记忆库及后续检索中移除，但保留底层的轨迹记录与证据审计链条。重复删除或跨用户删除返回 404。
+
+```bash
+curl -s -X DELETE -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/memories/mem_e5f6g7h8"
+```
+
+响应示例：
+```json
+{
+  "ok": true,
+  "deleted_memory_id": "mem_e5f6g7h8"
+}
+```
+
+#### 9. 手动录入正式记忆（标记 source=manual，支持挂载证据轨迹）
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer dev-key-developer" \

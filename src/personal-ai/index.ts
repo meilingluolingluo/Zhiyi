@@ -100,6 +100,7 @@ export function createPersonalAI(
         projectStore,
         candidateStore: base.candidateStore,
         memoryStore: base.memoryStore,
+        trajectoryStore: base.trajectoryStore,
       },
       params,
     );
@@ -221,6 +222,7 @@ export function createPersonalAI(
   const toolGateway: ZhiyiToolGateway = new ZhiyiToolGateway({
     memoryStore: base.memoryStore,
     candidateStore: base.candidateStore,
+    trajectoryStore: base.trajectoryStore,
     businessTaskManager,
     goalStore,
     projectStore,
@@ -274,6 +276,7 @@ export function createPersonalAI(
 
   const butlerCoordinator: ButlerCoordinator = new ButlerCoordinator({
     agentStore: base.agentStore,
+    memoryStore: base.memoryStore,
     agentSelector,
     businessTaskManager,
     taskRepo: repo,
@@ -314,6 +317,7 @@ export function createPersonalAI(
     directRunner,
     openClawRunner,
     butlerCoordinator,
+    toolGateway,
   });
 
   const router: Router = express.Router();
@@ -338,6 +342,7 @@ export function createPersonalAI(
       agentStore: base.agentStore,
       memoryStore: base.memoryStore,
       candidateStore: base.candidateStore,
+      trajectoryStore: base.trajectoryStore,
       userProfiles,
       goalStore,
       projectStore,

@@ -53,6 +53,7 @@ const MIGRATIONS: readonly string[] = [
   '006_memory_evolution',
   '007_proactive_assistant',
   '008_butler_router_watchdog',
+  '009_memory_extraction_pipeline',
 ];
 
 /** 定位迁移脚本：优先工作目录，其次相对编译产物目录。 */
