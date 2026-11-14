@@ -625,7 +625,11 @@ client = OpenAI(
       $('proxyModel').value = data.model || '';
 
       if (data.apiKeySet) {
-        $('proxyApiKeyTip').textContent = '已保存 API Key (' + data.apiKeyMasked + ')，留空表示不修改';
+        $('proxyApiKey').placeholder = '已配置（留空保持不变）';
+        $('proxyApiKeyTip').textContent = '密钥已保存在本地，输入新密钥可覆盖';
+      } else {
+        $('proxyApiKey').placeholder = 'sk-...';
+        $('proxyApiKeyTip').textContent = '密钥仅保存在本机网关，绝不向外部泄露';
       }
 
       var reuse = (data.memoryReuseProxy !== false);
@@ -635,6 +639,7 @@ client = OpenAI(
       currentMemAuth = data.memoryAuthMode || 'api_key';
       $('memProtocol').value = data.memoryProtocol || 'auto';
       $('memModel').value = data.memoryModel || '';
+      $('memApiKey').placeholder = data.memoryApiKeySet ? '已配置（留空保持不变）' : '留空沿用主模型 Key';
 
       if ($('ducxReport')) $('ducxReport').checked = (data.ducxReport !== false);
       if ($('ducxExecutable') && data.ducxExecutable) $('ducxExecutable').value = data.ducxExecutable;
