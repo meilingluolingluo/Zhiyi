@@ -18,6 +18,7 @@ import { ProactiveScheduler } from './proactive/proactive-scheduler';
 import { ProactiveStore } from './proactive/proactive-store';
 import { createPersonalAIDomainRouter } from './routes-domain';
 import { AgentSelector } from './runtime/agent-selector';
+import { ButlerCoordinator } from './runtime/butler-coordinator';
 import { DirectExecutionRunner } from './runtime/direct-execution-runner';
 import { OpenClawAgentRunner } from './runtime/openclaw/agent-runner';
 import { ZhiyiToolGateway } from './runtime/openclaw/tool-gateway';
@@ -27,9 +28,12 @@ import { executeImageGeneration } from '../upstream/media-handlers';
 import { BusinessTaskManager } from './task/business-task-manager';
 import { BusinessTaskRepository } from './task/business-task-repository';
 import { ExecutionEventStore } from './task/execution-event-store';
+import { TaskAcceptanceManager } from './task/task-acceptance-manager';
+import { TaskDependencyRepository } from './task/task-dependency-repository';
 import { TaskManager } from './task/task-manager';
 import { TaskRepository } from './task/task-repository';
 import { TaskWorker } from './worker/task-worker';
+import { Watchdog } from './worker/watchdog';
 
 export interface PersonalAIAssembly {
   router: Router;
@@ -50,6 +54,10 @@ export interface PersonalAIAssembly {
   openClawRunner: OpenClawAgentRunner;
   toolGateway: ZhiyiToolGateway;
   agentSelector: AgentSelector;
+  dependencyRepo: TaskDependencyRepository;
+  acceptanceManager: TaskAcceptanceManager;
+  watchdog: Watchdog;
+  butlerCoordinator: ButlerCoordinator;
 }
 
 export function createPersonalAI(
@@ -91,6 +99,28 @@ export function createPersonalAI(
     );
   };
 
+  const dependencyRepo: TaskDependencyRepository = new TaskDependencyRepository(base.db);
+  const proactiveStore: ProactiveStore = new ProactiveStore(base.db);
+
+  const acceptanceManager: TaskAcceptanceManager = new TaskAcceptanceManager({
+    db: base.db,
+    businessRepo,
+    taskRepo: repo,
+    eventStore: executionEventStore,
+    onDecisionNeeded: ({ userId, taskId, reason, reworkCount }) => {
+      proactiveStore.createIfNew({
+        userId,
+        kind: 'decision_needed',
+        entityType: 'task',
+        entityId: taskId,
+        dedupeKey: `acceptance:decision:${taskId}:${reworkCount}`,
+        title: '任务验收未通过需人工决策',
+        summary: `任务【${taskId}】在经过 ${reworkCount} 次返工后仍未通过验收（${reason}），已暂停自动推进，请人工审核决策。`,
+        evidence: { task_id: taskId, reason, rework_count: reworkCount },
+      });
+    },
+  });
+
   const businessTaskManager: BusinessTaskManager = new BusinessTaskManager(
     base.db,
     businessRepo,
@@ -98,6 +128,8 @@ export function createPersonalAI(
     base.agentStore,
     executionEventStore,
     onTaskCompleted,
+    dependencyRepo,
+    acceptanceManager,
   );
   const taskManager: TaskManager = new TaskManager(
     repo,
@@ -116,6 +148,17 @@ export function createPersonalAI(
       )
     : null;
 
+  const watchdog: Watchdog = new Watchdog({
+    db: base.db,
+    taskRepo: repo,
+    businessRepo,
+    businessTaskManager,
+    proactiveStore,
+    logger: base.logger,
+    dependencyRepo,
+    eventStore: executionEventStore,
+  });
+
   const worker: TaskWorker = new TaskWorker({
     config,
     multica: config.multica,
@@ -124,6 +167,7 @@ export function createPersonalAI(
     logger: base.logger,
     agentStore: base.agentStore,
     eventStore: executionEventStore,
+    watchdog,
     onExecutionTerminalInTx: (
       taskId: string,
       status: 'completed' | 'failed' | 'cancelled',
@@ -153,7 +197,6 @@ export function createPersonalAI(
     logger: base.logger,
   });
 
-  const proactiveStore: ProactiveStore = new ProactiveStore(base.db);
   const proactiveEngine: ProactiveEngine = new ProactiveEngine({
     userProfiles,
     goalStore,
@@ -203,6 +246,23 @@ export function createPersonalAI(
 
   const agentSelector: AgentSelector = new AgentSelector(base.agentStore, repo);
 
+  const butlerCoordinator: ButlerCoordinator = new ButlerCoordinator({
+    agentStore: base.agentStore,
+    agentSelector,
+    businessTaskManager,
+    taskRepo: repo,
+    dependencyRepo,
+    acceptanceManager,
+    eventStore: executionEventStore,
+    proactiveStore,
+    goalStore,
+    projectStore,
+    modelAdapter,
+    directRunner,
+    openClawRunner,
+    logger: base.logger,
+  });
+
   const runtime: PersonalAIRuntime = new PersonalAIRuntime({
     config: base.config,
     personalAI: config,
@@ -227,6 +287,7 @@ export function createPersonalAI(
     agentSelector,
     directRunner,
     openClawRunner,
+    butlerCoordinator,
   });
 
   const router: Router = express.Router();
@@ -287,6 +348,10 @@ export function createPersonalAI(
     openClawRunner,
     toolGateway,
     agentSelector,
+    dependencyRepo,
+    acceptanceManager,
+    watchdog,
+    butlerCoordinator,
   };
 }
 

@@ -521,6 +521,79 @@ export function createPersonalAIDomainRouter(deps: DomainRouterDeps): Router {
     }
   });
 
+  router.post('/v1/personal-ai/work-tasks/:id/approve', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const acceptanceManager = deps.businessTaskManager.getAcceptanceManager();
+    if (!acceptanceManager) {
+      res.status(501).json(errorBody('TaskAcceptanceManager 未配置', 'not_implemented'));
+      return;
+    }
+    const body = bodyOf(req);
+    const note = typeof body.note === 'string' ? body.note : undefined;
+    try {
+      const task = acceptanceManager.manualApprove(identity.user_id, req.params.id, note);
+      res.json({ task });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.get('/v1/personal-ai/work-tasks/:id/dependencies', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const dependencyRepo = deps.businessTaskManager.getDependencyRepo();
+    if (!dependencyRepo) {
+      res.status(501).json(errorBody('TaskDependencyRepository 未配置', 'not_implemented'));
+      return;
+    }
+    try {
+      const dependencies = dependencyRepo.listDependencies(identity.user_id, req.params.id);
+      const dependents = dependencyRepo.listDependents(identity.user_id, req.params.id);
+      res.json({ dependencies, dependents });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.post('/v1/personal-ai/work-tasks/:id/dependencies', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const dependencyRepo = deps.businessTaskManager.getDependencyRepo();
+    if (!dependencyRepo) {
+      res.status(501).json(errorBody('TaskDependencyRepository 未配置', 'not_implemented'));
+      return;
+    }
+    const body = bodyOf(req);
+    const dependsOnId = typeof body.depends_on_id === 'string' ? body.depends_on_id.trim() : '';
+    if (!dependsOnId) {
+      res.status(400).json(errorBody('depends_on_id 不能为空', 'invalid_request'));
+      return;
+    }
+    try {
+      const dep = dependencyRepo.addDependency(identity.user_id, req.params.id, dependsOnId);
+      res.status(201).json({ dependency: dep });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
+  router.delete('/v1/personal-ai/work-tasks/:id/dependencies/:depends_on_id', (req, res): void => {
+    const identity = requireIdentity(req, res, deps.config);
+    if (!identity) return;
+    const dependencyRepo = deps.businessTaskManager.getDependencyRepo();
+    if (!dependencyRepo) {
+      res.status(501).json(errorBody('TaskDependencyRepository 未配置', 'not_implemented'));
+      return;
+    }
+    try {
+      const removed = dependencyRepo.removeDependency(identity.user_id, req.params.id, req.params.depends_on_id);
+      res.json({ removed });
+    } catch (error) {
+      handleDomainError(res, error);
+    }
+  });
+
   async function handleExecuteOrRetry(
     req: ExpressRequest,
     res: ExpressResponse,

@@ -1,21 +1,7 @@
-# 知忆（Zhiyi）· Personal AI Gateway V1
+# 知忆（Zhiyi）
 
-> **对外品牌名：知忆 / Zhiyi**（取「知」与「忆」：既懂你，也记得你）。
-> 代码中的 `personal-ai` 目录、`/v1/personal-ai` 路由与 `PERSONAL_AI_*` 环境变量属于内部模块名与接口契约，**保持不变**，以免破坏已有集成；文档中出现的「Personal AI」均指这套运行时。
-
-知忆是一个**独立于模型厂商与 Agent 框架**的个人 AI 记忆网关。Codex、Claude Code、DeepSeek 等不同 Agent 都把模型请求发到同一个 Gateway，由 Gateway 识别用户与 Agent、检索同一份长期记忆、注入请求、转发上游模型，并在后台沉淀新的候选记忆。
-
-在 MVP 的「记忆 + 网关」之上，本仓库还提供 **知忆 Personal AI Gateway V1**：ADP Chat Client 直接把它当作对话后端，普通问答走模型直连，代码/仓库类任务自动委派给本机 MultiCA CLI（Codex / Claude Code 等 Agent 执行），结果统一汇总并沉淀回记忆。详见 [§8 Personal AI Gateway V1](#8-personal-ai-gateway-v1)。
-
-核心闭环：
-
-```
-Agent 请求 → 身份识别 → 检索记忆 → 追加 Memory Context → 转发 MultiCA/Mock
-          → 响应原样返回 → 异步保存轨迹 → 异步提取候选 → 人工确认入库
-          → 其它 Agent 后续可检索使用
-```
-
-> 第一版目标是**完整闭环可跑**，不是生产级大规模部署。技术选型：Node.js 22 + TypeScript 单进程、Express、Node 内置 `node:sqlite`、关键词加权检索（不引入向量库 / Mem0）、进程内异步队列、内置 OpenAI 兼容 Mock 上游。
+> **知忆是个人 AI 经验操作系统**。前端使用 ADP Chat 作为日常工作台，后端 Gateway 驱动模型、记忆与外部 Agent 接入。
+> 完整产品定位、核心表面与演进路线详见 [PRODUCT.md](./PRODUCT.md)。
 
 ---
 

@@ -211,6 +211,18 @@ export class TaskRepository {
       .map(rowToExecutionTask);
   }
 
+  /** 查询所有活动中的执行（包含 direct_llm 与外部异步任务），供 Watchdog 全局巡检 */
+  listAllActive(limit: number): ExecutionTask[] {
+    return this.db
+      .all<RawExecutionTaskRow>(
+        `SELECT * FROM execution_tasks
+          WHERE status IN (${ACTIVE_STATUS_SQL})
+          ORDER BY updated_at ASC LIMIT ?`,
+        [Math.max(1, limit)],
+      )
+      .map(rowToExecutionTask);
+  }
+
   listByTaskId(
     userId: string,
     taskId: string,

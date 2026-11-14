@@ -73,7 +73,8 @@ export type ProactiveNotificationKind =
   | 'task_completed_summary'
   | 'project_progress'
   | 'goal_stalled'
-  | 'decision_needed';
+  | 'decision_needed'
+  | 'review_required';
 
 export const PROACTIVE_NOTIFICATION_KINDS: readonly ProactiveNotificationKind[] = [
   'task_overdue',
@@ -85,6 +86,7 @@ export const PROACTIVE_NOTIFICATION_KINDS: readonly ProactiveNotificationKind[] 
   'project_progress',
   'goal_stalled',
   'decision_needed',
+  'review_required',
 ];
 
 export interface QuietHoursWindow {
@@ -198,6 +200,17 @@ export interface ProjectFilters {
   offset?: number;
 }
 
+export type ReviewStatus = 'none' | 'pending_review' | 'approved' | 'rejected';
+
+export interface TaskDependency {
+  id: number;
+  user_id: string;
+  task_id: string;
+  depends_on_id: string;
+  dependency_type: 'finish_to_start';
+  created_at: string;
+}
+
 export interface BusinessTask {
   id: string;
   user_id: string;
@@ -209,6 +222,11 @@ export interface BusinessTask {
   priority: PriorityLevel;
   assignee_agent_id: string | null;
   due_at: string | null;
+  acceptance_criteria: string | null;
+  review_status: ReviewStatus;
+  rework_count: number;
+  max_rework: number;
+  depends_on_task_ids?: string[];
   deleted_at: string | null;
   created_at: string;
   updated_at: string;
@@ -223,6 +241,9 @@ export interface NewBusinessTaskInput {
   assignee_agent_id?: string | null;
   due_at?: string | null;
   status?: string;
+  acceptance_criteria?: string | null;
+  max_rework?: number;
+  depends_on_task_ids?: string[];
 }
 
 export interface BusinessTaskPatch {
@@ -234,6 +255,11 @@ export interface BusinessTaskPatch {
   priority?: number;
   assignee_agent_id?: string | null;
   due_at?: string | null;
+  acceptance_criteria?: string | null;
+  review_status?: ReviewStatus;
+  rework_count?: number;
+  max_rework?: number;
+  depends_on_task_ids?: string[];
 }
 
 export interface BusinessTaskFilters {

@@ -26,7 +26,8 @@ export type StructuredIntentAction =
   | 'delegate_task'
   | 'create_goal'
   | 'create_project'
-  | 'create_task';
+  | 'create_task'
+  | 'plan_complex_goal';
 
 const STRUCTURED_ACTIONS: ReadonlySet<string> = new Set([
   'direct_llm',
@@ -34,6 +35,7 @@ const STRUCTURED_ACTIONS: ReadonlySet<string> = new Set([
   'create_goal',
   'create_project',
   'create_task',
+  'plan_complex_goal',
 ]);
 
 export interface StructuredIntent {
@@ -63,6 +65,7 @@ export function buildIntentClassificationPrompt(
     '- "create_goal": 用户明确要求创建或记录一个长期目标（Goal）',
     '- "create_project": 用户明确要求创建一个项目（Project）',
     '- "create_task": 用户明确要求记录一条待办业务任务（暂不立即执行）',
+    '- "plan_complex_goal": 用户提出需要管家拆解规划、多步骤实施或协调不同 Worker 协同推进的复杂目标（如“先调研再开发”、“规划并落地”、“拆解这个项目”等）',
     agentSummaries.length > 0 ? `可用 Agent：${agentSummaries.join('；')}` : '可用 Agent：默认',
     projectSummaries.length > 0 ? `用户当前项目：${projectSummaries.join('；')}` : '用户当前项目：无',
     goalSummaries.length > 0 ? `用户当前目标：${goalSummaries.join('；')}` : '用户当前目标：无',

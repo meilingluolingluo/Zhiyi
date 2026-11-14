@@ -304,6 +304,14 @@ describe('Migration 004 (V1.5 Phase 1)', () => {
 
     db.exec(`
       BEGIN TRANSACTION;
+      DROP INDEX IF EXISTS idx_task_deps_depends_on;
+      DROP INDEX IF EXISTS idx_task_deps_task;
+      DROP TABLE IF EXISTS task_dependencies;
+      ALTER TABLE tasks DROP COLUMN acceptance_criteria;
+      ALTER TABLE tasks DROP COLUMN review_status;
+      ALTER TABLE tasks DROP COLUMN rework_count;
+      ALTER TABLE tasks DROP COLUMN max_rework;
+      DELETE FROM schema_migrations WHERE version = '008_butler_router_watchdog';
       DROP INDEX IF EXISTS idx_proactive_notifications_user_status;
       DROP INDEX IF EXISTS idx_proactive_notifications_user_entity;
       DROP TABLE IF EXISTS proactive_notifications;

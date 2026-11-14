@@ -16,6 +16,7 @@ import {
   type NewBusinessTaskInput,
   type PageResult,
   type PriorityLevel,
+  type ReviewStatus,
   type SubtaskStats,
 } from '../domain/types';
 import type { UserProfileStore } from '../domain/user-profile-store';
@@ -62,6 +63,10 @@ function rowToTask(row: BusinessTask): BusinessTask {
     priority: Number(row.priority) as PriorityLevel,
     assignee_agent_id: row.assignee_agent_id ?? null,
     due_at: row.due_at ?? null,
+    acceptance_criteria: row.acceptance_criteria ?? null,
+    review_status: (row.review_status ?? 'none') as ReviewStatus,
+    rework_count: Number(row.rework_count ?? 0),
+    max_rework: Number(row.max_rework ?? 2),
     deleted_at: row.deleted_at ?? null,
   };
 }
@@ -230,6 +235,14 @@ export class BusinessTaskRepository {
       input.due_at === undefined || input.due_at === null || input.due_at === ''
         ? null
         : String(input.due_at).trim().slice(0, 64);
+    const acceptanceCriteria: string | null =
+      input.acceptance_criteria === undefined || input.acceptance_criteria === null || input.acceptance_criteria === ''
+        ? null
+        : String(input.acceptance_criteria).trim().slice(0, 4000);
+    const maxRework: number =
+      typeof input.max_rework === 'number' && Number.isInteger(input.max_rework) && input.max_rework >= 0
+        ? input.max_rework
+        : 2;
 
     this.userProfiles.ensureUserInTx(userId, userOptions);
     if (projectId) this.assertOwnedProjectInTx(userId, projectId);
@@ -242,8 +255,9 @@ export class BusinessTaskRepository {
     this.db.run(
       `INSERT INTO tasks
          (id, user_id, project_id, parent_task_id, title, description, status, priority,
-          assignee_agent_id, due_at, deleted_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+          assignee_agent_id, due_at, acceptance_criteria, review_status, rework_count, max_rework,
+          deleted_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', 0, ?, NULL, ?, ?)`,
       [
         id,
         userId,
@@ -255,6 +269,8 @@ export class BusinessTaskRepository {
         priority,
         assigneeAgentId,
         dueAt,
+        acceptanceCriteria,
+        maxRework,
         now,
         now,
       ],
@@ -354,13 +370,12 @@ export class BusinessTaskRepository {
     return stats;
   }
 
-  update(userId: string, taskId: string, patch: BusinessTaskPatch): BusinessTask | undefined {
-    return this.db.transaction((): BusinessTask | undefined => {
-      const existing: BusinessTask | undefined = this.getActive(userId, taskId);
-      if (!existing) return undefined;
+  updateInTx(userId: string, taskId: string, patch: BusinessTaskPatch): BusinessTask | undefined {
+    const existing: BusinessTask | undefined = this.getActive(userId, taskId);
+    if (!existing) return undefined;
 
-      const assignments: string[] = [];
-      const params: unknown[] = [];
+    const assignments: string[] = [];
+    const params: unknown[] = [];
 
       if ('title' in patch) {
         assignments.push('title = ?');
@@ -405,6 +420,37 @@ export class BusinessTaskRepository {
           assignments.push('parent_task_id = ?');
           params.push(parentId);
         }
+      }
+
+      if ('acceptance_criteria' in patch) {
+        const val = patch.acceptance_criteria;
+        assignments.push('acceptance_criteria = ?');
+        params.push(val === null || val === '' ? null : String(val).trim().slice(0, 4000));
+      }
+      if ('review_status' in patch) {
+        const val = patch.review_status;
+        const validStatuses: readonly ReviewStatus[] = ['none', 'pending_review', 'approved', 'rejected'];
+        if (typeof val !== 'string' || !validStatuses.includes(val as ReviewStatus)) {
+          throw new DomainError(400, 'invalid_review_status', '非法的 review_status');
+        }
+        assignments.push('review_status = ?');
+        params.push(val);
+      }
+      if ('rework_count' in patch) {
+        const val = patch.rework_count;
+        if (typeof val !== 'number' || !Number.isInteger(val) || val < 0) {
+          throw new DomainError(400, 'invalid_rework_count', 'rework_count 必须为非负整数');
+        }
+        assignments.push('rework_count = ?');
+        params.push(val);
+      }
+      if ('max_rework' in patch) {
+        const val = patch.max_rework;
+        if (typeof val !== 'number' || !Number.isInteger(val) || val < 0) {
+          throw new DomainError(400, 'invalid_max_rework', 'max_rework 必须为非负整数');
+        }
+        assignments.push('max_rework = ?');
+        params.push(val);
       }
 
       let nextAssignee: string | null = existing.assignee_agent_id;
@@ -495,7 +541,10 @@ export class BusinessTaskRepository {
         throw new DomainError(409, 'status_conflict', '任务状态已被并发修改', 'conflict');
       }
       return this.getActive(userId, taskId);
-    });
+  }
+
+  update(userId: string, taskId: string, patch: BusinessTaskPatch): BusinessTask | undefined {
+    return this.db.transaction((): BusinessTask | undefined => this.updateInTx(userId, taskId, patch));
   }
 
   /**
@@ -597,6 +646,31 @@ export class BusinessTaskRepository {
       [nextStatus, new Date().toISOString(), taskId, userId, expectedStatus],
     );
     return res.changes > 0;
+  }
+
+  /**
+   * 验收闭环专用的同事务状态与元数据更新，由 Execution 终态验收流程受控触发。
+   */
+  updateAcceptanceReviewInTx(
+    userId: string,
+    taskId: string,
+    patch: {
+      review_status: ReviewStatus;
+      status: BusinessTaskStatus;
+      rework_count?: number;
+    },
+  ): BusinessTask | undefined {
+    const existing = this.getActive(userId, taskId);
+    if (!existing) return undefined;
+    const now = new Date().toISOString();
+    const reworkCount = patch.rework_count ?? existing.rework_count;
+    this.db.run(
+      `UPDATE tasks
+       SET review_status = ?, status = ?, rework_count = ?, updated_at = ?
+       WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+      [patch.review_status, patch.status, reworkCount, now, taskId, userId],
+    );
+    return this.getActive(userId, taskId);
   }
 
   casSyncTerminalInTx(

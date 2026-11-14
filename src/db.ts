@@ -52,6 +52,7 @@ const MIGRATIONS: readonly string[] = [
   '005_execution_lifecycle',
   '006_memory_evolution',
   '007_proactive_assistant',
+  '008_butler_router_watchdog',
 ];
 
 /** 定位迁移脚本：优先工作目录，其次相对编译产物目录。 */
@@ -148,8 +149,14 @@ export class Database {
     return this.handle.prepare(sql).all(...params.map(toSqlValue)) as T[];
   }
 
-  /** 简易事务包装，失败时回滚。 */
+  private inTransaction = false;
+
+  /** 简易事务包装，支持嵌套调用复用外层事务，失败时回滚。 */
   transaction<T>(fn: () => T): T {
+    if (this.inTransaction) {
+      return fn();
+    }
+    this.inTransaction = true;
     this.handle.exec('BEGIN IMMEDIATE');
     try {
       const result: T = fn();
@@ -158,6 +165,8 @@ export class Database {
     } catch (error) {
       this.handle.exec('ROLLBACK');
       throw error;
+    } finally {
+      this.inTransaction = false;
     }
   }
 

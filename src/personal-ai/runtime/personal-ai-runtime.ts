@@ -45,6 +45,7 @@ import {
   type AgentSelector,
 } from './agent-selector';
 import { buildPersonalAIContext, type BuiltContext } from './context-builder';
+import type { ButlerCoordinator } from './butler-coordinator';
 import type { DirectExecutionRunner } from './direct-execution-runner';
 import type { OpenClawAgentRunner } from './openclaw/agent-runner';
 import { isOpenClawAgent } from './openclaw/types';
@@ -84,6 +85,7 @@ export interface RuntimeDeps {
   agentSelector?: AgentSelector;
   directRunner?: DirectExecutionRunner;
   openClawRunner?: OpenClawAgentRunner;
+  butlerCoordinator?: ButlerCoordinator;
 }
 
 export interface RunInput {
@@ -792,6 +794,39 @@ export class PersonalAIRuntime {
         currentTurnPrompt,
         registeredAgents,
       )?.agentId;
+
+      const isComplexDecomposeRequest =
+        (structured && structured.action === 'plan_complex_goal') ||
+        (/(先.*再.*|拆解.*任务|多步骤|规划并|调研并开发|分步实施|阶段性推进)/i.test(currentTurnPrompt) &&
+          !/(查询|怎么做|什么是|解释)/i.test(currentTurnPrompt) &&
+          structured?.action !== 'direct_llm');
+
+      if (isComplexDecomposeRequest && this.deps.butlerCoordinator) {
+        const planText = [structured?.title, structured?.description, currentTurnPrompt]
+          .filter(Boolean)
+          .join('\n');
+        yield { type: 'text_delta', content: '🤖 知忆管家正在规划目标并拆解任务体系...\n\n' };
+        const plan = await this.deps.butlerCoordinator.planComplexGoal(
+          identity.user_id,
+          planText,
+          {
+            projectId: structured?.project_id,
+            preferredAgents: structured?.preferred_agent_id ? [structured.preferred_agent_id] : undefined,
+          },
+        );
+        const executionResult = await this.deps.butlerCoordinator.executePlan(
+          identity.user_id,
+          plan,
+          {
+            projectId: structured?.project_id,
+            conversationId: identity.conversation_id,
+            multicaEnabled: this.deps.personalAI.multica.enabled,
+          },
+        );
+        capture.text = executionResult.summaryMessage;
+        yield { type: 'text_delta', content: executionResult.summaryMessage };
+        return;
+      }
 
       if (structured && structured.action === 'delegate_task') {
         const delegationText = [structured.title, structured.description, currentTurnPrompt]

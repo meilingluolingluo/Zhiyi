@@ -18,6 +18,8 @@ import {
 } from '../task/execution-lifecycle';
 import type { ExecutionTask, TaskPatch, TaskRepository } from '../task/task-repository';
 
+import type { Watchdog } from './watchdog';
+
 const INTERNAL_STATUSES: readonly string[] = [
   'pending',
   'dispatching',
@@ -38,6 +40,7 @@ export interface TaskWorkerDeps {
   agentStore?: AgentStore;
   eventStore?: ExecutionEventStore;
   staleExecutionMs?: number;
+  watchdog?: Watchdog;
   onExecutionTerminalInTx?: (taskId: string, status: 'completed' | 'failed' | 'cancelled') => void;
   onStartupRecoverInTx?: () => void;
   onTaskCompleted?: (params: {
@@ -518,6 +521,9 @@ export class TaskWorker {
     this.busy = true;
     try {
       this.reconcileStalledExecutions();
+      if (this.deps.watchdog) {
+        await this.deps.watchdog.tick();
+      }
       const tasks: ExecutionTask[] = this.deps.repo.listActive(this.deps.multica.maxConcurrentTasks);
       for (const task of tasks) {
         if (!task.external_task_id && task.status === 'pending') {

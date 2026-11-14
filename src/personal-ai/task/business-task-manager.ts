@@ -26,6 +26,8 @@ import {
   formatTaskLifecycleSummary,
   type ExecutionFailureCategory,
 } from './execution-lifecycle';
+import type { TaskAcceptanceManager } from './task-acceptance-manager';
+import type { TaskDependencyRepository } from './task-dependency-repository';
 import type { ExecutionTask, TaskRepository } from './task-repository';
 
 export interface PrepareExecutionOptions {
@@ -66,6 +68,8 @@ export interface BusinessTaskDetail {
   task: BusinessTask;
   subtasks: BusinessTask[];
   subtask_stats: SubtaskStats;
+  dependencies: string[];
+  dependents: string[];
   latest_execution: ExecutionTask | null;
   execution_count: number;
   recent_events: ExecutionEventRecord[];
@@ -98,6 +102,8 @@ export class BusinessTaskManager {
       agentId: string | null;
       result: string;
     }) => void,
+    private readonly dependencyRepo?: TaskDependencyRepository,
+    private readonly acceptanceManager?: TaskAcceptanceManager,
   ) {}
 
   private validateExecutableAgent(agentId: string, multicaEnabled: boolean): AgentProfile {
@@ -182,15 +188,33 @@ export class BusinessTaskManager {
     input: NewBusinessTaskInput,
     userOptions?: EnsureUserOptions,
   ): BusinessTask {
-    return this.businessRepo.create(userId, input, userOptions);
+    return this.db.transaction((): BusinessTask => {
+      const task = this.businessRepo.createInTx(userId, input, userOptions);
+      if (input.depends_on_task_ids && input.depends_on_task_ids.length > 0) {
+        this.dependencyRepo?.setDependencies(userId, task.id, input.depends_on_task_ids);
+        if (!this.dependencyRepo?.areDependenciesSatisfied(userId, task.id)) {
+          this.businessRepo.casStatusInTx(userId, task.id, task.status, 'blocked');
+        }
+      }
+      const refreshed = this.businessRepo.getActive(userId, task.id) || task;
+      return {
+        ...refreshed,
+        depends_on_task_ids: this.dependencyRepo?.listDependencies(userId, task.id) ?? [],
+      };
+    });
   }
 
   get(userId: string, taskId: string): BusinessTask | undefined {
-    return this.businessRepo.getActive(userId, taskId);
+    const task = this.businessRepo.getActive(userId, taskId);
+    if (!task) return undefined;
+    return {
+      ...task,
+      depends_on_task_ids: this.dependencyRepo?.listDependencies(userId, taskId) ?? [],
+    };
   }
 
   getDetail(userId: string, taskId: string): BusinessTaskDetail | undefined {
-    const task = this.businessRepo.getActive(userId, taskId);
+    const task = this.get(userId, taskId);
     if (!task) return undefined;
     const subtasks = this.businessRepo.listSubtasks(userId, taskId);
     const execPage = this.taskRepo.listByTaskId(userId, taskId, 1, 0);
@@ -198,10 +222,14 @@ export class BusinessTaskManager {
     const recentEvents = this.eventStore
       ? this.eventStore.listByTask(userId, taskId, 30, 0).items
       : [];
+    const dependencies = this.dependencyRepo?.listDependencies(userId, taskId) ?? [];
+    const dependents = this.dependencyRepo?.listDependents(userId, taskId) ?? [];
     return {
       task,
       subtasks,
       subtask_stats: this.businessRepo.subtaskStats(subtasks),
+      dependencies,
+      dependents,
       latest_execution: latestExecution,
       execution_count: execPage.total,
       recent_events: recentEvents,
@@ -214,7 +242,17 @@ export class BusinessTaskManager {
   }
 
   update(userId: string, taskId: string, patch: BusinessTaskPatch): BusinessTask | undefined {
-    return this.businessRepo.update(userId, taskId, patch);
+    return this.db.transaction((): BusinessTask | undefined => {
+      if (patch.depends_on_task_ids) {
+        this.dependencyRepo?.setDependencies(userId, taskId, patch.depends_on_task_ids);
+      }
+      const updated = this.businessRepo.updateInTx(userId, taskId, patch);
+      if (!updated) return undefined;
+      return {
+        ...updated,
+        depends_on_task_ids: this.dependencyRepo?.listDependencies(userId, taskId) ?? [],
+      };
+    });
   }
 
   softDelete(userId: string, taskId: string, cascade = false): boolean {
@@ -302,6 +340,19 @@ export class BusinessTaskManager {
           '该任务已有正在执行的 Execution',
           'conflict',
         );
+      }
+
+      if (this.dependencyRepo) {
+        const unfinished = this.dependencyRepo.getUnfinishedDependencies(userId, task.id);
+        if (unfinished.length > 0) {
+          const names = unfinished.map((u) => `${u.title}(${u.id})[${u.status}]`).join(', ');
+          throw new DomainError(
+            409,
+            'dependencies_not_satisfied',
+            `前置依赖任务尚未完成，无法开始执行：${names}`,
+            'conflict',
+          );
+        }
       }
 
       const targetAgentId: string =
@@ -455,6 +506,23 @@ export class BusinessTaskManager {
     });
   }
 
+  /** 统一完成/推进执行的接口别名（代理至 finishDirectExecution） */
+  completeExecution(
+    executionId: string,
+    outcome:
+      | { status: 'completed'; result: string }
+      | {
+          status: 'failed';
+          error: string;
+          statusCode?: number;
+          errorCode?: string;
+          categoryOverride?: ExecutionFailureCategory;
+        }
+      | { status: 'cancelled'; error?: string },
+  ): boolean {
+    return this.finishDirectExecution(executionId, outcome);
+  }
+
   /** direct_llm 执行完成/失败/取消时，在同事务内写入分类结果、事件与任务终态。 */
   finishDirectExecution(
     executionId: string,
@@ -477,6 +545,30 @@ export class BusinessTaskManager {
       const now: string = new Date().toISOString();
 
       if (outcome.status === 'completed') {
+        const task = current.task_id ? this.businessRepo.getActive(current.user_id, current.task_id) : undefined;
+        const requiresReview = Boolean(task && this.acceptanceManager?.shouldRequireReview(task));
+
+        if (requiresReview && task && this.acceptanceManager) {
+          const acceptResult = this.acceptanceManager.processAcceptance({
+            userId: current.user_id,
+            taskId: task.id,
+            executionId,
+            result: outcome.result,
+          });
+          if (acceptResult.status !== 'approved') {
+            this.taskRepo.updateIfActive(executionId, {
+              status: 'completed',
+              result: outcome.result,
+              error_category: null,
+              error_code: null,
+              retryable: false,
+              needs_verification: acceptResult.status === 'escalated_to_user',
+              completed_at: now,
+            });
+            return true;
+          }
+        }
+
         const updated = this.taskRepo.updateIfActive(executionId, {
           status: 'completed',
           result: outcome.result,
@@ -496,7 +588,20 @@ export class BusinessTaskManager {
             status: 'completed',
             message: '执行成功完成',
           });
-          if (current.task_id) this.businessRepo.casSyncTerminalInTx(current.task_id, 'completed');
+          if (current.task_id) {
+            this.businessRepo.casSyncTerminalInTx(current.task_id, 'completed');
+            if (this.dependencyRepo) {
+              const dependents = this.dependencyRepo.listDependents(current.user_id, current.task_id);
+              for (const depId of dependents) {
+                if (this.dependencyRepo.areDependenciesSatisfied(current.user_id, depId)) {
+                  const depTask = this.businessRepo.getActive(current.user_id, depId);
+                  if (depTask && depTask.status === 'blocked') {
+                    this.businessRepo.updateInTx(current.user_id, depId, { status: 'ready' });
+                  }
+                }
+              }
+            }
+          }
         }
         return updated;
       }
@@ -558,7 +663,18 @@ export class BusinessTaskManager {
             needs_verification: classified.needsVerification,
           },
         });
-        if (current.task_id) this.businessRepo.casSyncTerminalInTx(current.task_id, 'failed');
+        if (current.task_id) {
+          this.businessRepo.casSyncTerminalInTx(current.task_id, 'failed');
+          if (this.dependencyRepo) {
+            const dependents = this.dependencyRepo.listDependents(current.user_id, current.task_id);
+            for (const depId of dependents) {
+              const depTask = this.businessRepo.getActive(current.user_id, depId);
+              if (depTask && (depTask.status === 'pending' || depTask.status === 'ready')) {
+                this.businessRepo.updateInTx(current.user_id, depId, { status: 'blocked' });
+              }
+            }
+          }
+        }
       }
       return updated;
     });
@@ -632,6 +748,43 @@ export class BusinessTaskManager {
   /** 供 TaskWorker 终态回写同事务调用。 */
   onExecutionTerminalInTx(taskId: string, status: 'completed' | 'failed' | 'cancelled'): void {
     this.businessRepo.casSyncTerminalInTx(taskId, status);
+    const task = this.db.get<{ user_id: string }>('SELECT user_id FROM tasks WHERE id = ?', [taskId]);
+    if (!task || !this.dependencyRepo) return;
+
+    if (status === 'completed') {
+      const dependents = this.dependencyRepo.listDependents(task.user_id, taskId);
+      for (const depId of dependents) {
+        if (this.dependencyRepo.areDependenciesSatisfied(task.user_id, depId)) {
+          const depTask = this.businessRepo.getActive(task.user_id, depId);
+          if (depTask && depTask.status === 'blocked') {
+            this.businessRepo.updateInTx(task.user_id, depId, { status: 'ready' });
+          }
+        }
+      }
+    } else if (status === 'failed') {
+      const dependents = this.dependencyRepo.listDependents(task.user_id, taskId);
+      for (const depId of dependents) {
+        const depTask = this.businessRepo.getActive(task.user_id, depId);
+        if (depTask && (depTask.status === 'pending' || depTask.status === 'ready')) {
+          this.businessRepo.updateInTx(task.user_id, depId, { status: 'blocked' });
+        }
+      }
+    }
+  }
+
+  getDependencyRepo(): TaskDependencyRepository | undefined {
+    return this.dependencyRepo;
+  }
+
+  getAcceptanceManager(): TaskAcceptanceManager | undefined {
+    return this.acceptanceManager;
+  }
+
+  /** 所有子任务完成时，推进父任务收敛为 completed。 */
+  advanceParentCompleted(userId: string, parentTaskId: string): boolean {
+    const parent = this.businessRepo.getActive(userId, parentTaskId);
+    if (!parent) return false;
+    return this.businessRepo.casStatusInTx(userId, parentTaskId, parent.status, 'completed');
   }
 
   /** 供 TaskManager 取消单条 execution_tasks 时同事务同步对应业务任务。 */

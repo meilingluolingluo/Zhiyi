@@ -150,4 +150,21 @@ export class ExecutionEventStore {
       total: Number(totalRow?.total ?? 0),
     };
   }
+
+  /** 获取指定执行最近产生的若干条事件（倒序排列，最新优先），供 Watchdog 等巡检组件快速分析。 */
+  listRecentByExecution(
+    userId: string,
+    executionId: string,
+    limit = 20,
+  ): ExecutionEventRecord[] {
+    const safeLimit = Math.min(Math.max(1, limit), 200);
+    const rows = this.db.all<RawExecutionEventRow>(
+      `SELECT * FROM execution_events
+        WHERE user_id = ? AND execution_id = ?
+        ORDER BY id DESC
+        LIMIT ?`,
+      [userId, executionId, safeLimit],
+    );
+    return rows.map(rowToRecord);
+  }
 }
