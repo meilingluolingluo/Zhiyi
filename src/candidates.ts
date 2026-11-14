@@ -212,6 +212,20 @@ export class CandidateStore {
       .map(rowToCandidate);
   }
 
+  count(userId: string, filters: CandidateFilters = {}): number {
+    const conditions: string[] = ['user_id = ?'];
+    const params: unknown[] = [userId];
+    if (filters.status !== undefined) {
+      conditions.push('status = ?');
+      params.push(filters.status);
+    }
+    const row = this.db.get<{ total: number }>(
+      `SELECT COUNT(*) AS total FROM memory_candidates WHERE ${conditions.join(' AND ')}`,
+      params,
+    );
+    return Number(row?.total ?? 0);
+  }
+
   /**
    * 幂等审批入库：用户审批通过后标记 verified_by_user=true，并在同事务内处理去重合并与冲突替代。
    */

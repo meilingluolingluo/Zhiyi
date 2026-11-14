@@ -295,4 +295,48 @@ export class MemoryStore {
     const row = this.db.get<{ total: number }>(sql, [userId]);
     return Number(row?.total ?? 0);
   }
+
+  countMatching(userId: string, filters: MemoryFilters = {}): number {
+    const conditions: string[] = ['user_id = ?'];
+    const params: unknown[] = [userId];
+    if (filters.status !== undefined) {
+      conditions.push('status = ?');
+      params.push(filters.status);
+    } else if (!filters.include_archived) {
+      conditions.push("status = 'active'");
+    }
+    if (filters.agent_id !== undefined) {
+      conditions.push('agent_id = ?');
+      params.push(filters.agent_id);
+    }
+    if (filters.project_id !== undefined) {
+      conditions.push('project_id = ?');
+      params.push(filters.project_id);
+    }
+    if (filters.goal_id !== undefined) {
+      conditions.push('goal_id = ?');
+      params.push(filters.goal_id);
+    }
+    if (filters.task_id !== undefined) {
+      conditions.push('task_id = ?');
+      params.push(filters.task_id);
+    }
+    if (filters.type !== undefined) {
+      conditions.push('type = ?');
+      params.push(filters.type);
+    }
+    if (filters.scope !== undefined) {
+      conditions.push('scope = ?');
+      params.push(filters.scope);
+    }
+    if (filters.category !== undefined) {
+      conditions.push('category = ?');
+      params.push(filters.category);
+    }
+    const row = this.db.get<{ total: number }>(
+      `SELECT COUNT(*) AS total FROM memories WHERE ${conditions.join(' AND ')}`,
+      params,
+    );
+    return Number(row?.total ?? 0);
+  }
 }

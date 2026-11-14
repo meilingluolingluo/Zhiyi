@@ -110,4 +110,20 @@ export class TrajectoryStore {
     );
     return { items, total: Number(totalRow?.total ?? 0), limit, offset };
   }
+
+  getById(userId: string, id: string): Trajectory | undefined {
+    return this.db.get<Trajectory>(
+      'SELECT * FROM trajectories WHERE user_id = ? AND (id = ? OR request_id = ?)',
+      [userId, id, id],
+    );
+  }
+
+  findByIds(userId: string, ids: string[]): Trajectory[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.db.all<Trajectory>(
+      `SELECT * FROM trajectories WHERE user_id = ? AND (id IN (${placeholders}) OR request_id IN (${placeholders}))`,
+      [userId, ...ids, ...ids],
+    );
+  }
 }

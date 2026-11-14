@@ -140,6 +140,12 @@ DEFAULT_MODEL=your-model-name
 | GET | `/v1/memory-candidates` | 候选列表（可按 status 过滤） |
 | POST | `/v1/memory-candidates/:id/approve` | 确认入库（幂等） |
 | POST | `/v1/memory-candidates/:id/reject` | 拒绝候选 |
+| GET | `/v1/memory-desk/memories` | **记忆台**：正式记忆列表（支持 type/scope/category/status 过滤与分页） |
+| POST | `/v1/memory-desk/memories` | **记忆台**：手动创建正式记忆（`source='manual'`，可挂载证据轨迹） |
+| GET | `/v1/memory-desk/candidates` | **记忆台**：候选记忆列表（默认 `pending`，支持 status 过滤与分页） |
+| GET | `/v1/memory-desk/candidates/:id` | **记忆台**：候选详情（含 `evidence_trajectory_ids` 与人机对话证据摘要） |
+| POST | `/v1/memory-desk/candidates/:id/approve` | **记忆台**：审批候选入库（幂等；强校验有效证据轨迹，无有效证据拒绝 400） |
+| POST | `/v1/memory-desk/candidates/:id/reject` | **记忆台**：拒绝候选记忆（幂等；已通过的候选禁止拒绝 409） |
 | GET | `/__mock__/last-request` | **仅 Mock 模式**：最后一次上游请求（用于验证注入） |
 | POST | `/__mock__/configure` | **仅 Mock 模式**：设置响应行为 |
 | POST | `/__mock__/reset` | **仅 Mock 模式**：清空请求记录并复位行为 |
@@ -296,6 +302,130 @@ curl -s -X POST http://127.0.0.1:8787/v1/chat/completions \
     ]
   }'
 # 复位：curl -s -X POST http://127.0.0.1:8787/__mock__/reset -d '{}'
+```
+
+### 5.10 记忆台（Memory Desk）治理链路
+
+记忆台统一通过 `/v1/memory-desk` 前缀提供轻量管理接口，身份严格通过 API Key 解析，越权一律 404。
+
+#### 1. 查看待审批候选记忆列表（默认 pending，支持分页）
+
+```bash
+curl -s -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/candidates?limit=10&offset=0"
+```
+
+响应示例：
+```json
+{
+  "items": [
+    {
+      "id": "cand_a1b2c3d4",
+      "user_id": "u1",
+      "type": "semantic",
+      "scope": "personal",
+      "category": "preference",
+      "content": "包管理工具统一使用 pnpm",
+      "confidence": 0.95,
+      "status": "pending",
+      "evidence_trajectory_ids": ["req_20261114_trace1"]
+    }
+  ],
+  "total": 1,
+  "limit": 10,
+  "offset": 0
+}
+```
+
+#### 2. 查看候选详情与证据轨迹摘要
+
+审查候选记忆时可直接获取人机交互摘要（用户提问与模型答复截取）：
+
+```bash
+curl -s -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/candidates/cand_a1b2c3d4"
+```
+
+响应示例：
+```json
+{
+  "candidate": {
+    "id": "cand_a1b2c3d4",
+    "content": "包管理工具统一使用 pnpm",
+    "status": "pending"
+  },
+  "evidence_trajectory_ids": ["req_20261114_trace1"],
+  "evidence_trajectories": [
+    {
+      "id": "traj_001",
+      "request_id": "req_20261114_trace1",
+      "agent_id": "developer",
+      "model": "deepseek-chat",
+      "user_prompt": "以后所有项目统一用 pnpm 管理依赖",
+      "assistant_response": "已记录该规范，后续依赖管理优先使用 pnpm。",
+      "created_at": "2026-11-14T10:00:00.000Z"
+    }
+  ]
+}
+```
+
+#### 3. 审批通过候选入库（幂等；无证据或证据无效返回 400）
+
+```bash
+curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/candidates/cand_a1b2c3d4/approve"
+```
+
+响应示例：
+```json
+{
+  "ok": true,
+  "idempotent": false,
+  "memory": {
+    "memory_id": "mem_e5f6g7h8",
+    "user_id": "u1",
+    "type": "semantic",
+    "scope": "personal",
+    "content": "包管理工具统一使用 pnpm",
+    "source": "candidate:cand_a1b2c3d4",
+    "verified_by_user": true,
+    "evidence_trajectory_ids": ["req_20261114_trace1"]
+  },
+  "candidate": {
+    "id": "cand_a1b2c3d4",
+    "status": "approved",
+    "created_memory_id": "mem_e5f6g7h8"
+  }
+}
+```
+
+#### 4. 在正式记忆库中查询已审核记忆
+
+```bash
+curl -s -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/memories?scope=personal&type=semantic"
+```
+
+#### 5. 拒绝候选记忆（幂等）
+
+```bash
+curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
+  "http://127.0.0.1:8787/v1/memory-desk/candidates/cand_a1b2c3d4/reject"
+```
+
+#### 6. 手动录入正式记忆（标记 source=manual，支持挂载证据轨迹）
+
+```bash
+curl -s -X POST -H "Authorization: Bearer dev-key-developer" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "职业角色为资深架构师，代码注释遵循最新设计规范",
+    "type": "semantic",
+    "scope": "personal",
+    "category": "profile",
+    "evidence_trajectory_ids": ["req_20261114_trace1"]
+  }' \
+  "http://127.0.0.1:8787/v1/memory-desk/memories"
 ```
 
 ---

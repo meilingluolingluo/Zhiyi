@@ -12,6 +12,7 @@ import { MemoryStore } from './memories';
 import { MockUpstream } from './mock-upstream';
 import { createPersonalAI, type PersonalAIAssembly } from './personal-ai';
 import type { PersonalAIConfig } from './personal-ai/config';
+import { createMemoryDeskRouter } from './memory-desk';
 import { createRouter, errorMiddleware } from './routes';
 import { TrajectoryStore } from './trajectories';
 import { createSettingsRouter } from './upstream/routes';
@@ -170,6 +171,7 @@ export async function createApp(
   }
   // Personal AI 路由：它有自己的可信身份解析（含可选签名校验）。
   app.use(personalAI.router);
+  app.use(createMemoryDeskRouter(deps));
   app.use(createRouter(deps));
   app.use(errorMiddleware);
 

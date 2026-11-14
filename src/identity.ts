@@ -41,7 +41,7 @@ function firstNonEmpty(...values: Array<unknown>): string | null {
   return null;
 }
 
-function extractApiKey(headers: HeaderBag): string | null {
+export function extractApiKey(headers: HeaderBag): string | null {
   const authorization: string | undefined = headerValue(headers, 'authorization');
   if (authorization) {
     const match: RegExpMatchArray | null = authorization.match(/^Bearer\s+(.+)$/i);
