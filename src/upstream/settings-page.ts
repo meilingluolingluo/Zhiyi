@@ -535,6 +535,13 @@ client = OpenAI(
       $('reuseBadge').textContent = '已复用 Proxy 组';
       $('reuseBadge').className = 'badge ok';
       $('memoryCustomSection').classList.add('collapsed');
+
+      // 保持底层输入字段完全同步
+      $('memBaseUrl').value = pUrl;
+      $('memModel').value = pModel;
+      if ($('memModelSelect') && $('proxyModelSelect')) {
+        $('memModelSelect').value = $('proxyModelSelect').value;
+      }
     } else {
       if (sumBox) sumBox.style.display = 'none';
       $('reuseBadge').textContent = '独立配置';
@@ -624,7 +631,6 @@ client = OpenAI(
     if (currentVal && currentVal !== '__custom__') {
       for (var i = 0; i < selectEl.options.length; i++) {
         if (selectEl.options[i].value === currentVal) {
-          selectEl.selectedIndex = i;
           selectedId = currentVal;
           break;
         }
@@ -632,21 +638,17 @@ client = OpenAI(
     }
 
     if (!selectedId) {
-      if (firstModelId) {
-        selectEl.value = firstModelId;
-        selectedId = firstModelId;
-      } else {
-        selectEl.value = '__custom__';
-        selectedId = '__custom__';
-      }
+      selectedId = firstModelId || '__custom__';
     }
 
-    if (selectEl.value === '__custom__') {
+    selectEl.value = selectedId;
+
+    if (selectedId === '__custom__') {
       inputEl.style.display = 'block';
-      inputEl.value = currentVal && currentVal !== '__custom__' ? currentVal : '';
+      inputEl.value = (currentVal && currentVal !== '__custom__') ? currentVal : '';
     } else {
       inputEl.style.display = 'none';
-      inputEl.value = selectEl.value;
+      inputEl.value = selectedId;
     }
 
     syncAllLinkages();
@@ -683,15 +685,22 @@ client = OpenAI(
       toast('成功获取 ' + list.length + ' 个可用模型！');
       if (tipEl) tipEl.textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，已默认选择首个模型';
 
+      var currentTarget = forMemory ? $('memModel').value : $('proxyModel').value;
+
       populateModelSelect(
         forMemory ? $('memModelSelect') : $('proxyModelSelect'),
         forMemory ? $('memModel') : $('proxyModel'),
         list,
-        forMemory ? $('memModel').value : $('proxyModel').value
+        currentTarget
       );
-      if (!forMemory) {
-        populateModelSelect($('memModelSelect'), $('memModel'), list, $('memModel').value);
+
+      var chosenVal = forMemory ? $('memModel').value : $('proxyModel').value;
+      if (tipEl) tipEl.textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，当前选择: ' + chosenVal;
+
+      if (!forMemory && $('memoryReuseProxy').checked) {
+        populateModelSelect($('memModelSelect'), $('memModel'), list, chosenVal);
       }
+      syncAllLinkages();
     }).catch(function(err) {
       toast('拉取模型失败: ' + err.message + '，可直接手动输入', 'bad');
     }).finally(function() {
@@ -713,6 +722,11 @@ client = OpenAI(
       $('proxyModel').style.display = 'none';
       $('proxyModel').value = this.value;
     }
+    // 上下联动：复用模式下，Memory 组（下）跟随变化
+    if ($('memoryReuseProxy').checked) {
+      if ($('memModelSelect')) $('memModelSelect').value = this.value;
+      $('memModel').value = $('proxyModel').value;
+    }
     syncAllLinkages();
   });
 
@@ -729,13 +743,37 @@ client = OpenAI(
   });
 
   /* 输入事件全链路联动 */
-  $('proxyBaseUrl').addEventListener('input', syncAllLinkages);
-  $('proxyModel').addEventListener('input', syncAllLinkages);
+  $('proxyBaseUrl').addEventListener('input', function(){
+    if ($('memoryReuseProxy').checked) {
+      $('memBaseUrl').value = this.value;
+    }
+    syncAllLinkages();
+  });
+  $('proxyModel').addEventListener('input', function(){
+    if ($('proxyModelSelect')) $('proxyModelSelect').value = this.value;
+    if ($('memoryReuseProxy').checked) {
+      $('memModel').value = this.value;
+      if ($('memModelSelect')) $('memModelSelect').value = this.value;
+    }
+    syncAllLinkages();
+  });
   if ($('proxyProtocol')) $('proxyProtocol').addEventListener('change', syncAllLinkages);
   $('memBaseUrl').addEventListener('input', syncAllLinkages);
-  $('memModel').addEventListener('input', syncAllLinkages);
+  $('memModel').addEventListener('input', function(){
+    if ($('memModelSelect')) $('memModelSelect').value = this.value;
+    syncAllLinkages();
+  });
   if ($('memProtocol')) $('memProtocol').addEventListener('change', syncAllLinkages);
-  $('memoryReuseProxy').addEventListener('change', syncAllLinkages);
+  $('memoryReuseProxy').addEventListener('change', function(){
+    if (this.checked) {
+      $('memBaseUrl').value = $('proxyBaseUrl').value;
+      $('memModel').value = $('proxyModel').value;
+      if ($('memModelSelect') && $('proxyModelSelect')) {
+        $('memModelSelect').value = $('proxyModelSelect').value;
+      }
+    }
+    syncAllLinkages();
+  });
 
   /* 预设卡片点击填入并连贯联动 */
   $('presetsGrid').addEventListener('click', function(e){
@@ -745,22 +783,30 @@ client = OpenAI(
     var found = presets.find(function(p){ return p.id === id; });
     if (!found) return;
 
-    $('proxyBaseUrl').value = found.baseUrl || '';
+    var targetUrl = found.baseUrl || '';
+    var targetModel = found.defaultModel || (found.models && found.models.length > 0 ? (typeof found.models[0] === 'string' ? found.models[0] : found.models[0].id) : '');
+
+    // 1. 设置主模型 Proxy 组（上）
+    $('proxyBaseUrl').value = targetUrl;
     setProxyAuth(found.authMode || 'api_key');
-    if (found.upstreamProtocol) $('proxyProtocol').value = found.upstreamProtocol;
-    if (found.defaultModel) $('proxyModel').value = found.defaultModel;
+    if (found.upstreamProtocol && $('proxyProtocol')) $('proxyProtocol').value = found.upstreamProtocol;
 
     if (found.models && found.models.length > 0) {
-      populateModelSelect($('proxyModelSelect'), $('proxyModel'), found.models, found.defaultModel);
-      populateModelSelect($('memModelSelect'), $('memModel'), found.models, found.defaultModel);
-      $('proxyModelTip').textContent = '✓ 已预置常用模型，点击右上角「拉取模型列表」可获取该服务实时模型';
+      populateModelSelect($('proxyModelSelect'), $('proxyModel'), found.models, targetModel);
+    } else {
+      $('proxyModel').value = targetModel;
+      if ($('proxyModelSelect')) $('proxyModelSelect').value = targetModel;
     }
+    $('proxyModelTip').textContent = '✓ 已预置常用模型，点击右上角「拉取模型列表」可获取该服务实时模型';
 
-    // 若当前未复用且记忆字段为空，自动填充对应默认值
-    if (!$('memoryReuseProxy').checked && !$('memModel').value.trim()) {
-      if (found.defaultModel) $('memModel').value = found.defaultModel;
-      if (found.baseUrl) $('memBaseUrl').value = found.baseUrl;
-      if (found.upstreamProtocol) $('memProtocol').value = found.upstreamProtocol;
+    // 2. 上下全面联动：同步设置 Memory 组（下）
+    $('memBaseUrl').value = targetUrl;
+    if (found.upstreamProtocol && $('memProtocol')) $('memProtocol').value = found.upstreamProtocol;
+    if (found.models && found.models.length > 0) {
+      populateModelSelect($('memModelSelect'), $('memModel'), found.models, targetModel);
+    } else {
+      $('memModel').value = targetModel;
+      if ($('memModelSelect')) $('memModelSelect').value = targetModel;
     }
 
     syncAllLinkages();
@@ -808,8 +854,10 @@ client = OpenAI(
         var list = res.data || [];
         if (list.length > 0) {
           populateModelSelect($('proxyModelSelect'), $('proxyModel'), list, $('proxyModel').value);
-          populateModelSelect($('memModelSelect'), $('memModel'), list, $('memModel').value);
-          $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，已默认选择首个模型';
+          populateModelSelect($('memModelSelect'), $('memModel'), list, $('memoryReuseProxy').checked ? $('proxyModel').value : $('memModel').value);
+          var chosen = $('proxyModel').value;
+          $('proxyModelTip').textContent = '✓ 已从服务获取 ' + list.length + ' 个可用模型，当前选择: ' + chosen;
+          syncAllLinkages();
         }
       }).catch(function(){});
     }).catch(function(err){
