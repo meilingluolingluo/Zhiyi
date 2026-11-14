@@ -366,16 +366,18 @@ export class PersonalAIRuntime {
       return;
     }
 
-    const memoryToolNames = new Set([
+    const directToolNames = new Set([
       'recall_memory',
       'remember_memory',
       'update_memory',
       'memory_search',
       'memory_get',
+      'web_search',
+      'web_fetch',
     ]);
     const registeredTools = this.deps.toolGateway
       .listRegisteredTools()
-      .filter((tool) => memoryToolNames.has(tool.name));
+      .filter((tool) => directToolNames.has(tool.name));
 
     if (registeredTools.length === 0) {
       for await (const delta of this.deps.modelAdapter.stream(context.messages, {
@@ -403,7 +405,7 @@ export class PersonalAIRuntime {
     const toolCtx: ZhiyiToolContext = {
       userId: identity.user_id,
       identity,
-      allowedTools: memoryToolNames,
+      allowedTools: directToolNames,
       publicOrigin,
     };
 

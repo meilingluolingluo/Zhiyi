@@ -1400,7 +1400,7 @@ export class ZhiyiToolGateway {
     this.registerTool({
       name: 'web_search',
       label: '实时网页搜索',
-      description: '按 query 实时搜索互联网并返回权威结果、结构化摘要与正文（兼容 DeepSeek Tools 协议）。',
+      description: '按 query 实时搜索互联网并返回权威结果、结构化摘要与正文（兼容 DeepSeek Tools 协议）。当用户需要联网搜索实时资讯、外部知识、查询网址或公开网络信息时调用。',
       parameters: Type.Object(
         {
           query: Type.String({ minLength: 1, maxLength: 128, description: '搜索关键词，支持 site:、-、"..."、lang: 等语法' }),
@@ -1413,9 +1413,15 @@ export class ZhiyiToolGateway {
         if (!this.deps.searchWeb) {
           throw new Error('当前网关未配置网络搜索能力');
         }
-        const res = await this.deps.searchWeb(params, { signal });
+        const rawQuery = String(params.query ?? '').trim();
+        const safeQuery = rawQuery.slice(0, 128);
+        const safeParams = {
+          ...params,
+          query: safeQuery,
+        };
+        const res = await this.deps.searchWeb(safeParams, { signal });
         if (!res.results || res.results.length === 0) {
-          return { text: '未检索到相关网页结果。', details: { query: params.query, count: 0, results: [] } };
+          return { text: '未检索到相关网页结果。', details: { query: safeQuery, count: 0, results: [] } };
         }
         const lines = res.results.map(
           (item, idx) =>
